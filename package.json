@@ -1,0 +1,16 @@
+{
+  "name": "shift4-sales-engine",
+  "version": "1.0.0",
+  "description": "Shift4 Payments — Australian market sales intelligence app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
