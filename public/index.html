@@ -1,0 +1,2870 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shift4 Payments — Sales Engine</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #1a1d27; } ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .tag { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; }
+    .badge-green  { background: #052e16; color: #4ade80; border: 1px solid #14532d; }
+    .badge-blue   { background: #0c1a2e; color: #60a5fa; border: 1px solid #1e3a5f; }
+    .badge-yellow { background: #1c1400; color: #fbbf24; border: 1px solid #713f12; }
+    .badge-red    { background: #1f0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+    .badge-purple { background: #150d2e; color: #c084fc; border: 1px solid #4c1d95; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useCallback, useRef } = React;
+
+    /* ─────────────────────── SUPABASE CLIENT ──────────────── */
+
+    const supabase = (window.SUPABASE_URL && window.SUPABASE_KEY)
+      ? window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_KEY)
+      : null;
+
+    async function fetchCallLog() {
+      if (!supabase) {
+        try { return JSON.parse(localStorage.getItem("shift4_call_log") || "[]"); } catch { return []; }
+      }
+      const { data, error } = await supabase
+        .from("call_logs")
+        .select("*")
+        .order("time", { ascending: true });
+      if (error) console.warn("Supabase fetch failed:", error.message);
+      const rows = (data || []).map(r => ({
+        id: r.id, time: r.time, outcome: r.outcome,
+        stageReached: r.stage_reached, objectionId: r.objection_id,
+        industryId: r.industry_id, callType: r.call_type, isFirstCall: r.is_first_call ?? true,
+        openerScore: r.opener_score, confidenceScore: r.confidence_score, rapportScore: r.rapport_score,
+        notes: r.notes, weight: r.weight,
+      }));
+      // Auto-migrate any localStorage calls not yet in Supabase
+      try {
+        const local = JSON.parse(localStorage.getItem("shift4_call_log") || "[]");
+        const supaIds = new Set(rows.map(r => r.id));
+        const unsync = local.filter(c => !supaIds.has(c.id));
+        if (unsync.length) {
+          await Promise.all(unsync.map(c => persistCall(c)));
+          rows.push(...unsync);
+          localStorage.removeItem("shift4_call_log");
+        }
+      } catch {}
+      return rows;
+    }
+
+    async function persistCall(call) {
+      // Always cache locally
+      try {
+        const existing = JSON.parse(localStorage.getItem("shift4_call_log") || "[]");
+        if (!existing.find(c => c.id === call.id)) {
+          localStorage.setItem("shift4_call_log", JSON.stringify([...existing, call]));
+        }
+      } catch {}
+      if (!supabase) return;
+      const { error } = await supabase.from("call_logs").upsert({
+        id: call.id, time: call.time, outcome: call.outcome,
+        stage_reached: call.stageReached, objection_id: call.objectionId,
+        industry_id: call.industryId || null, call_type: call.callType || "outbound",
+        is_first_call: call.isFirstCall ?? true,
+        opener_score: call.openerScore, confidence_score: call.confidenceScore,
+        rapport_score: call.rapportScore, notes: call.notes, weight: call.weight,
+      });
+      if (error) console.warn("Supabase save failed:", error.message);
+    }
+
+    /* ─────────────────────── STORAGE + COACHING UTILS ──────────────── */
+
+    function useLocalStorage(key, defaultValue) {
+      const [value, setValue] = useState(() => {
+        try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : defaultValue; }
+        catch { return defaultValue; }
+      });
+      const set = useCallback((v) => {
+        const next = typeof v === "function" ? v(value) : v;
+        setValue(next);
+        try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+      }, [value]);
+      return [value, set];
+    }
+
+    const OUTCOME_WEIGHT = { won: 10, progressing: 7, qualified_lost: 4, lost: 2, noanswer: 1, voicemail: 1, wrongnumber: 0 };
+    const BAD_OUTCOMES   = new Set(["lost", "noanswer", "voicemail", "wrongnumber"]);
+    const GOOD_OUTCOMES  = new Set(["won", "progressing"]);
+
+    function calcWeight(call) {
+      const base = OUTCOME_WEIGHT[call.outcome] ?? 0;
+      const skill = ((call.openerScore + call.confidenceScore + call.rapportScore) / 3) * 2;
+      return Math.round((base * 0.6 + skill * 0.4) * 10) / 10;
+    }
+
+    function getTodayCalls(log) {
+      const today = new Date().toDateString();
+      return log.filter(c => new Date(c.time).toDateString() === today);
+    }
+
+    function getBadStreak(log) {
+      const today = getTodayCalls(log);
+      let streak = 0;
+      for (let i = today.length - 1; i >= 0; i--) {
+        if (BAD_OUTCOMES.has(today[i].outcome)) streak++;
+        else break;
+      }
+      return streak;
+    }
+
+    function getHourlyBreakdown(log) {
+      const today = getTodayCalls(log);
+      const hours = {};
+      today.forEach(c => {
+        const h = new Date(c.time).getHours();
+        if (!hours[h]) hours[h] = { calls: [], good: 0, bad: 0, score: 0 };
+        hours[h].calls.push(c);
+        if (GOOD_OUTCOMES.has(c.outcome)) hours[h].good++;
+        else if (BAD_OUTCOMES.has(c.outcome)) hours[h].bad++;
+        hours[h].score = Math.round(hours[h].calls.reduce((s, x) => s + x.weight, 0) / hours[h].calls.length * 10) / 10;
+      });
+      return hours;
+    }
+
+    function getGaps(log) {
+      const today = getTodayCalls(log);
+      if (today.length < 2) return null;
+      // Most common objection
+      const objCounts = {};
+      today.forEach(c => { if (c.objectionId) objCounts[c.objectionId] = (objCounts[c.objectionId] || 0) + 1; });
+      const topObj = Object.entries(objCounts).sort((a, b) => b[1] - a[1])[0];
+      // Most common lost stage
+      const stageCounts = {};
+      today.filter(c => BAD_OUTCOMES.has(c.outcome)).forEach(c => { if (c.stageReached) stageCounts[c.stageReached] = (stageCounts[c.stageReached] || 0) + 1; });
+      const weakStage = Object.entries(stageCounts).sort((a, b) => b[1] - a[1])[0];
+      // Weakest skill
+      const scores = { opener: 0, confidence: 0, rapport: 0 };
+      today.forEach(c => { scores.opener += c.openerScore; scores.confidence += c.confidenceScore; scores.rapport += c.rapportScore; });
+      const n = today.length;
+      const avgScores = { opener: scores.opener/n, confidence: scores.confidence/n, rapport: scores.rapport/n };
+      const weakSkill = Object.entries(avgScores).sort((a, b) => a[1] - b[1])[0];
+      return { topObj, weakStage, weakSkill, avgScores };
+    }
+
+    function getDailyScore(log) {
+      const today = getTodayCalls(log);
+      if (!today.length) return 0;
+      return Math.round(today.reduce((s, c) => s + c.weight, 0) / today.length * 10) / 10;
+    }
+
+    function getFirstCallRate(log) {
+      const today = getTodayCalls(log);
+      const firstCalls = today.filter(c => c.isFirstCall);
+      if (!firstCalls.length) return null;
+      const wins = firstCalls.filter(c => c.outcome === "won").length;
+      return { rate: Math.round((wins / firstCalls.length) * 100), wins, total: firstCalls.length };
+    }
+
+    function getIndustryBreakdown(log) {
+      const today = getTodayCalls(log);
+      const bd = {};
+      today.filter(c => c.industryId).forEach(c => {
+        if (!bd[c.industryId]) bd[c.industryId] = { calls: 0, wins: 0, weight: 0 };
+        bd[c.industryId].calls++;
+        bd[c.industryId].weight += c.weight || 0;
+        if (c.outcome === "won") bd[c.industryId].wins++;
+      });
+      return Object.entries(bd).map(([id, d]) => {
+        const ind = INDUSTRIES.find(i => i.id === id);
+        return { id, name: ind?.name?.split("(")[0].trim() || id, icon: ind?.icon || "🏭",
+          ...d, winRate: Math.round((d.wins / d.calls) * 100),
+          avgWeight: Math.round((d.weight / d.calls) * 10) / 10 };
+      }).sort((a, b) => b.winRate - a.winRate);
+    }
+
+    function getWeekHistory(log) {
+      const days = {};
+      log.forEach(c => {
+        const d = new Date(c.time).toDateString();
+        if (!days[d]) days[d] = [];
+        days[d].push(c);
+      });
+      const result = [];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(); d.setDate(d.getDate() - i);
+        const key = d.toDateString();
+        const calls = days[key] || [];
+        const score = calls.length ? Math.round(calls.reduce((s, c) => s + c.weight, 0) / calls.length * 10) / 10 : null;
+        result.push({ label: i === 0 ? "Today" : d.toLocaleDateString("en-AU", { weekday: "short" }), score, calls: calls.length });
+      }
+      return result;
+    }
+
+    function checkHourTrigger(log) {
+      const hourly = getHourlyBreakdown(log);
+      const now = new Date().getHours();
+      const h = hourly[now];
+      if (!h || h.calls.length < 4) return false;
+      return (h.good / h.calls.length) < 0.25;
+    }
+
+    /* ─────────────────────────── DATA ─────────────────────────── */
+
+    const INDUSTRIES = [
+      {
+        id: "hospitality",
+        icon: "🍽️",
+        name: "Hospitality (Restaurants, Cafes, Bars)",
+        target: "Restaurant Owners, Cafe Managers, Bar/Venue GMs",
+        annualRevenue: "$500k – $5M",
+        callTime: "15–25 mins",
+        callType: "Transactional — prospect already knows their pain",
+        useCase: "SkyTab POS integration, pay-at-table portables, auto-surcharging to pass fees to patrons, split billing, real-time Z-report via dashboard.",
+        hook: "\"How much did you pay in merchant fees last month?\" — then show them what $0 feels like.",
+        reconciliation: "Batch closure timing is critical. Late-night venues (bars) closing at 3am need their batch cutoff AFTER their last trade, otherwise Friday-night sales book into Saturday in Xero/MYOB and the bookkeeper loses their mind.",
+        rejection: [
+          "Fear of downtime — 'We can't have the system go down on a Saturday night'",
+          "Staff retraining anxiety during a busy season (summer, Christmas)",
+          "Already mid-contract with Tyro or NAB",
+        ],
+        pivot: "Offer a phased rollout — start with one terminal as a trial run alongside their existing setup. If they're mid-contract, diary the renewal date and come back 60 days prior.",
+        altTarget: "If they are a tiny 1-person coffee cart doing <$2k/month, refer to Square and move on — your time is better spent elsewhere.",
+        buyerSignals: ["Asking about POS integrations", "Complaining about Tyro fees or hardware crashes", "Just opened a second location"],
+      },
+      {
+        id: "lodging",
+        icon: "🏨",
+        name: "Lodging & Hotels",
+        target: "General Managers, Directors of Finance, Revenue Managers",
+        annualRevenue: "$1M – $50M",
+        callTime: "45–60 mins (plus 1–2 follow-up calls)",
+        callType: "Consultative — multi-stakeholder, longer sales cycle, high-value deal",
+        useCase: "PMS (Property Management System) integration for seamless room charges, secure pre-auth for incidentals, integrated online booking payments, F&B terminals throughout the property, 24/7 support SLA.",
+        hook: "\"What PMS are you on? We've done full integrations with [list Mews, Opera, Lightspeed]. Your checkout experience could look completely different by next quarter.\"",
+        reconciliation: "Pre-auth (security deposit) releases are the number-one finance headache. Guests see a 'double charge' on their bank app for 3–5 days post-checkout — the front desk gets complaints. Make sure Shift4's pre-auth release timeline is crystal clear in your demo and mapped to the PMS workflow.",
+        rejection: [
+          "Locked into a 3-year bank terminal contract",
+          "PMS vendor mandates a specific legacy gateway (common with older Opera installs)",
+          "Finance director is change-averse and happy with the status quo",
+        ],
+        pivot: "Sell a beachhead: pitch Shift4 exclusively for the hotel's on-site restaurant/bar while leaving the room billing gateway untouched for now. Land and expand once they trust the brand.",
+        altTarget: "For boutique B&Bs doing simple swipe-and-go, a simpler product may be overkill — they likely need Square or Zeller rather than a full enterprise integration.",
+        buyerSignals: ["Just rebranded or under new ownership", "Complaining about weekend settlement delays", "Expanding to a second property"],
+      },
+      {
+        id: "stadiums",
+        icon: "🏟️",
+        name: "Sports & Entertainment Venues",
+        target: "Stadium/Arena Ops Directors, F&B Operations Managers, Ticketing GMs",
+        annualRevenue: "$5M+",
+        callTime: "60+ mins across 3–4 discovery calls; enterprise procurement process",
+        callType: "Enterprise — multiple champions, legal review, SLA negotiation required",
+        useCase: "VenueNext platform: mobile ordering from seats, self-serve kiosks, roaming PAX terminals for beer vendors, integrated ticketing + payments, real-time revenue splits between F&B sub-vendors.",
+        hook: "\"VenueNext is literally what powers the Super Bowl. If it can handle 80,000 people ordering at halftime, it can handle your Friday night crowd.\"",
+        reconciliation: "Revenue splitting across multiple sub-vendors (merch, catering, ticketing) is the #1 configuration risk. If revenue routing isn't set up correctly, the wrong money lands in the wrong entity's account. This needs an implementation specialist in the room, not just a sales rep.",
+        rejection: [
+          "Extreme uptime anxiety — one outage during a finals game is catastrophic",
+          "Long procurement timelines (18–24 months) — decision made in committee",
+          "Existing 5-year deal with an incumbent (Verifone, Zettle Enterprise)",
+        ],
+        pivot: "Don't walk away — park it. Offer to set up a pilot with their roaming beer/merch vendors on PAX A920 Pro terminals only, with zero risk to core operations. Get a foot in the door, prove reliability, expand on renewal.",
+        altTarget: "Smaller venues (250-seat theatres, community sports clubs) are better served with a straightforward terminal setup without VenueNext — don't over-engineer the pitch.",
+        buyerSignals: ["Currently using paper wristbands for entry", "Complaining about cash handling risk at events", "Announced a venue upgrade or rebuild"],
+      },
+      {
+        id: "retail",
+        icon: "🛍️",
+        name: "Specialty Retail (Multi-location)",
+        target: "Boutique Owners, Retail Operations Managers, eCommerce Managers",
+        annualRevenue: "$500k – $10M",
+        callTime: "30–40 mins",
+        callType: "Consultative — pain is usually fragmented online/offline data",
+        useCase: "Unified commerce: Shift4Shop free eCommerce site + PAX in-store terminals feeding into one reporting dashboard. Inventory unified across online and physical. Auto-surcharging to offset card fees in-store.",
+        hook: "\"Are you running your website on one system and your in-store POS on another? You're basically doing your reporting twice. What if both showed up in the same dashboard?\"",
+        reconciliation: "Omnichannel statement confusion is common. Online Shift4Shop sales and in-store terminal sales appear as separate line items. Their bookkeeper needs to be briefed on how to reconcile both streams into a single Xero/MYOB account so month-end doesn't become a forensic exercise.",
+        rejection: [
+          "Already deeply invested in Shopify online — they love it and won't move",
+          "Think they'll 'figure it out later' once they get bigger",
+          "Small independent stores are price-sensitive and don't see the long-term value",
+        ],
+        pivot: "If they won't ditch Shopify, don't fight it — pitch Shift4 solely for the physical store via the standalone PAX terminal and surcharging model. One win is better than no win.",
+        altTarget: "Pure eCommerce-only stores with no physical presence are a weak prospect — Shift4Shop is competitive but they can get Shopify cheaper and they have zero urgency.",
+        buyerSignals: ["Just opened a physical store after being online-only", "Complaining Shopify's POS fees are too high", "Expanding to 2nd/3rd location"],
+      },
+      {
+        id: "health",
+        icon: "🏥",
+        name: "Healthcare & Allied Health",
+        target: "Practice Managers, Clinic Owners (Physio, Dental, GP, Chiro)",
+        annualRevenue: "$500k – $3M",
+        callTime: "20–35 mins",
+        callType: "Transactional/Consultative — decision maker is often the owner/manager",
+        useCase: "Tap-and-go terminals at reception desk, Medicare/Tyro integration research required, surcharging model to offset card fees, recurring billing for membership/package programs.",
+        hook: "\"How much are you spending a month in EFTPOS fees? For most clinics your size that's $400–$800 a month you're just giving away. We can bring that to zero.\"",
+        reconciliation: "Health claims add complexity: some payments are private, some are partial Medicare gaps. The Shift4 terminal records the payment from the patient but Medicare rebate hits a different bank account entirely — their bookkeeper needs a clear reconciliation workflow or end-of-month gets messy.",
+        rejection: [
+          "\"We use Tyro because it integrates with our clinical software (Cliniko, Nookal)\" — this is a real blocker; verify integration status",
+          "Practice owner not the decision-maker (business manager controls finance)",
+          "Don't want to deal with a new provider, 'not broke, don't fix it' mindset",
+        ],
+        pivot: "If Tyro integration with their clinical software is genuinely required, acknowledge it and don't oversell. Offer to check Shift4's current integration list and follow up. Honesty builds referrals.",
+        altTarget: "Bulk-billing only GP clinics (no private fees) have almost no card transactions — they are not viable prospects.",
+        buyerSignals: ["Recently opened a new practice", "Paying Tyro >$500/month in fees", "Launching a wellness membership program"],
+      },
+      {
+        id: "trades",
+        icon: "🔧",
+        name: "Trades & Mobile Services",
+        target: "Business Owners, Operations Managers (Plumbing, Electrical, HVAC, Cleaning)",
+        annualRevenue: "$300k – $5M",
+        callTime: "15–20 mins",
+        callType: "Transactional — short decision cycle, owner is always the buyer",
+        useCase: "Mobile PAX A920 Pro terminals for field technicians to take payment on-site, Shift4 virtual terminal for phone payments, surcharging to offset fees, same-day/next-day settlement to improve cash flow.",
+        hook: "\"Do your techs still have to invoice and chase payment after the job? What if they could take the money on-site the minute the work's done?\"",
+        reconciliation: "Multiple technicians all taking payments on separate terminals need to batch correctly at end-of-day. If someone forgets to settle their terminal it rolls into the next day and throws out the bank rec. Make sure they understand the auto-batch/auto-close feature.",
+        rejection: [
+          "\"We just invoice and do EFT\" — they don't see the cash-flow benefit of same-day payments",
+          "Owner-operator is price-sensitive; $30/month terminal fee feels like a cost, not an investment",
+          "Comfortable with the existing setup (Square Reader or manual invoicing)",
+        ],
+        pivot: "Frame it around cash flow, not fees: 'What's the average time from job completion to receiving payment today? What would it mean to cut that from 14 days to same day?' That reframes the cost conversation.",
+        altTarget: "Solo sole-traders (1 person, very low volume) may find a Square Reader adequate and cheaper. Focus on businesses with 3+ field staff.",
+        buyerSignals: ["Growing team of field techs", "Complaining about chasing invoices", "Owner-operator who is scaling and hiring"],
+      },
+    ];
+
+    const BATTLE_CARDS = [
+      {
+        id: "square",
+        competitor: "Square",
+        icon: "⬛",
+        summary: "Great for micro-businesses, terrible for anyone serious about scale.",
+        strengths: ["Dead simple setup — anyone can be up in 20 mins", "No monthly fees for basic plan", "Recognisable brand in AU market"],
+        weaknesses: [
+          "Flat 1.6% fee per tap — brutal at volume ($50k/month = $800 in fees)",
+          "No surcharging model — merchant always absorbs fees",
+          "Limited POS integrations for complex venues",
+          "Support is email-only; no dedicated account manager",
+          "Hardware is basic — no table-side ordering or kiosk capability",
+        ],
+        counterScript: "Square is a great starter tool. But at your volume, you're paying 1.6% on every single dollar. With Shift4's auto-surcharging model, you pass that cost to the customer as a small checkout fee — completely legal in Australia — and your effective merchant fee drops to zero. How much did you pay in card fees last month?",
+        winWhen: "Prospect processes >$10k/month and is annoyed at fee creep.",
+        loseTo: "Tiny volume micro-business where simplicity beats everything.",
+      },
+      {
+        id: "tyro",
+        competitor: "Tyro",
+        icon: "🟦",
+        summary: "The AU hospitality incumbent — well-known but aging, expensive, and clunky.",
+        strengths: ["Strong POS integration list (Lightspeed, Kounta, Impos)", "Well-known brand in hospitality; established trust", "Medicare integration for health sector"],
+        weaknesses: [
+          "Tiered pricing is confusing and hard to compare",
+          "Hardware is aging — older terminals, slower tap response",
+          "Notorious for outages (major AU outage in 2022 left thousands of venues unable to trade)",
+          "No surcharging pass-through model",
+          "Limited global footprint — can't grow with international operators",
+        ],
+        counterScript: "Tyro is the default in hospitality, but their 2022 outage took down 35,000 venues on a regular Saturday — that's existential for a restaurant. Shift4 runs 99.999% uptime SLAs. And unlike Tyro, with our auto-surcharging model you can completely offset your merchant fees. Plus our PAX A920 Pro is faster, more durable hardware.",
+        winWhen: "Prospect has been burned by a Tyro outage, or is frustrated with hardware reliability.",
+        loseTo: "If the prospect uses a POS system with a deep Tyro integration that Shift4 doesn't yet support — verify the integration list before promising anything.",
+      },
+      {
+        id: "zeller",
+        competitor: "Zeller",
+        icon: "🟩",
+        summary: "Shiny new startup with no monthly fees — great for small operators, not enterprise.",
+        strengths: ["No monthly fees — attractive to cost-conscious small businesses", "Slick branding and UX — feels modern", "Includes a free Zeller transaction account", "Growing AU market presence"],
+        weaknesses: [
+          "Very limited POS integrations — not suitable for complex venues",
+          "No surcharging / fee pass-through model",
+          "No multi-site management for growing businesses",
+          "No global enterprise support (stadiums, large hotel chains cannot use this)",
+          "Support is lean — startup-style responsiveness",
+        ],
+        counterScript: "Zeller looks cheap up front — no monthly fee sounds great. But when you look at what you're paying per transaction, and then realise you can't integrate it with your POS system or manage five locations from one dashboard, the math changes. Shift4 gives you enterprise-grade infrastructure with a pathway to zero fees through surcharging.",
+        winWhen: "Prospect is scaling beyond 1 location, or needs POS/ERP integration.",
+        loseTo: "Micro-business owner who is purely cost-driven and has simple, low-volume needs.",
+      },
+      {
+        id: "nab-commbank",
+        competitor: "NAB / CommBank (Big 4 Bank Terminals)",
+        icon: "🏦",
+        summary: "Cheap hardware rental, but locked into legacy infrastructure with terrible software.",
+        strengths: ["Existing banking relationship creates inertia ('we bank with them so we use their terminals')", "Terminal rental as low as $25/month — feels cheap", "Perceived safety of a Big 4 brand"],
+        weaknesses: [
+          "Software is legacy — zero business intelligence, no dashboards",
+          "No integration with modern POS or accounting platforms",
+          "Settlement can take 2–3 business days; weekend settlements often delayed to Monday",
+          "Locked into 3–4 year contracts with punishing early exit fees",
+          "No surcharging capability; merchant always eats the fee",
+          "Zero dedicated support — call centre, no account manager",
+        ],
+        counterScript: "Banks are great at banking — they're not built to be your technology partner. With CommBank you're paying $25/month for a terminal but you have no reporting, no integrations, and you wait until Tuesday to see your Friday takings. Shift4 settles next business day, gives you a real-time dashboard, and with surcharging you pay effectively zero in transaction fees. What is your current contract end date?",
+        winWhen: "Prospect is frustrated by slow settlement, poor support, or approaching contract renewal.",
+        loseTo: "Owner who has a 3-year term with heavy break fees and refuses to eat the exit cost — diary it for renewal.",
+      },
+      {
+        id: "zettle",
+        competitor: "PayPal / Zettle",
+        icon: "🔵",
+        summary: "Trusted brand but fee-heavy and lacking any serious POS ecosystem.",
+        strengths: ["PayPal brand recognition and trust", "Easy consumer-to-business payment acceptance", "No monthly fees at basic tier"],
+        weaknesses: [
+          "1.75% per tap — among the highest flat rates in AU market",
+          "No surcharging / fee pass-through",
+          "Funds held in PayPal balance — withdrawal to bank can take days",
+          "Limited to basic single-location use cases",
+          "No meaningful POS integrations for hospitality or retail",
+        ],
+        counterScript: "PayPal is trusted for online purchases, but Zettle's 1.75% per tap is one of the most expensive rates in the market. And your money sits in a PayPal wallet — you're not getting it same-day. With Shift4, you get faster settlement, real hardware built for your industry, and the ability to pass on the fee entirely through surcharging.",
+        winWhen: "Prospect is a small-to-mid retailer who adopted Zettle during COVID and has outgrown it.",
+        loseTo: "Businesses where the owner's personal PayPal familiarity overrides financial logic.",
+      },
+    ];
+
+    const INCENTIVES = [
+      {
+        id: "surcharge",
+        icon: "💸",
+        title: "Zero-Cost EFTPOS (Auto-Surcharging)",
+        tagline: "Your most powerful close.",
+        detail: "Shift4's built-in auto-surcharging legally passes the card processing fee to the customer at checkout — a small line item on the receipt. As long as the merchant meets the minimum processing volume, their effective merchant fee is $0. This is fully legal in Australia under ASIC/RBA guidelines for any amount above the actual cost of acceptance.",
+        script: "\"How much did you pay in merchant fees last month? Whatever that number is — that's money you're giving away for free. With Shift4, we can set up auto-surcharging so your customers absorb that tiny fee. You keep every dollar.\"",
+        caveats: "Surcharging must not exceed the actual cost of acceptance. Some business types (healthcare bulk-billing, certain charity contexts) may face patient/customer pushback. High-end fine dining restaurants sometimes choose NOT to surcharge for brand reasons — respect that and sell on other value.",
+      },
+      {
+        id: "ecommerce",
+        icon: "🌐",
+        title: "Free Shift4Shop eCommerce Platform",
+        tagline: "An $800/year value for $0.",
+        detail: "Merchants who process with Shift4 get access to Shift4Shop — a full-featured eCommerce website builder (Shopify-comparable) — completely free, as long as they process through Shift4. This is a genuine enterprise-grade platform, not a watered-down freebie.",
+        script: "\"Do you have an online store? If you're not selling online yet, or if you're paying Shopify $80+/month, we can give you the exact same capability for free — bundled into your Shift4 processing account. Your monthly saving starts before you've even processed a single transaction.\"",
+        caveats: "Prospects deeply embedded in Shopify will face switching costs (migrating product catalogue, SEO impact). Don't oversell migration ease — it's real work. Best positioned to prospects without a current online store or those just starting.",
+      },
+      {
+        id: "settlement",
+        icon: "⚡",
+        title: "Next-Day Settlement",
+        tagline: "Your Friday night takings — in your account Monday morning.",
+        detail: "Shift4 settles funds next business day, including weekend transactions. Banks (NAB, CommBank) often delay weekend settlement until Tuesday. For hospitality and retail, this is a genuine cash flow game-changer.",
+        script: "\"When does your Friday and Saturday takings actually hit your bank account right now? Tuesday? We settle next business day. Your weekend's revenue is in your account Monday morning — that's a real cash flow difference for your payroll cycle.\"",
+        caveats: "Settlement times can vary based on account setup and bank cut-off times. Always confirm specifics with the implementation team rather than guaranteeing an exact time.",
+      },
+      {
+        id: "nolock",
+        icon: "🔓",
+        title: "No Lock-In Contracts",
+        tagline: "The de-risk close.",
+        detail: "Shift4 operates on a 90-day cancellation notice rather than long fixed terms. This dramatically lowers the psychological barrier to switching, especially for prospects burned by banks with 3-year lock-in terms.",
+        script: "\"The reason most people stay with their current provider even when they're unhappy is the fear of being locked in. With Shift4, you give 90 days' notice and that's it — no break fees, no penalties. So there's genuinely nothing to lose by giving us a try.\"",
+        caveats: "Some hardware arrangements may have specific terms. Always verify the specific contract structure with your manager before making hard promises.",
+      },
+      {
+        id: "support",
+        icon: "🛎️",
+        title: "24/7 Dedicated AU Support + Local Staff (via Smartpay)",
+        tagline: "Someone who answers when things go wrong at 11pm on Saturday.",
+        detail: "Post-Smartpay acquisition, Shift4 retained local Australian staff and support infrastructure. Merchants get a dedicated account manager plus 24/7 technical support — not a call centre queue.",
+        script: "\"Who do you call when your terminal dies at 8pm on a Friday? With Tyro or the bank, it's a call centre. With Shift4, you have a dedicated contact — someone local who knows your setup and can get you back up fast. For a hospitality business that's not a nice-to-have, that's existential.\"",
+        caveats: "Response times during major outage events may vary. Do not over-promise on exact response SLAs — reference the account team for specifics.",
+      },
+    ];
+
+    const TESTIMONIALS = [
+      {
+        id: "t1",
+        quote: "When we were looking for a payment provider I found several suppliers not very helpful, until I met Shift4. They made everything really simple and got us set up super quickly.",
+        source: "Trustpilot — AU Merchant",
+        industry: "General Retail",
+        useWhen: "Prospect is worried the switch will be complicated or slow.",
+        tag: "Setup Ease",
+        tagColor: "badge-green",
+      },
+      {
+        id: "t2",
+        quote: "Thanks for the helpfulness, professionalism, and quick responses, which made the setup and ongoing support seamless. The next-day payment system is great for our cash flow.",
+        source: "Trustpilot — Hospitality",
+        industry: "Hospitality",
+        useWhen: "Competing against a bank on settlement speed, or emphasising support quality.",
+        tag: "Cash Flow + Support",
+        tagColor: "badge-blue",
+      },
+      {
+        id: "t3",
+        quote: "Amazing processing software! The software is efficient, dependable, and easy to learn. Customer support has also been very helpful when we've had questions.",
+        source: "SoftwareAdvice — Venue Manager",
+        industry: "Hospitality / Venues",
+        useWhen: "Prospect is nervous about reliability or staff retraining.",
+        tag: "Reliability",
+        tagColor: "badge-purple",
+      },
+      {
+        id: "t4",
+        quote: "Switching from our bank was one of the best decisions we made. The fees we were paying are literally gone — and our staff find the terminals so much faster than what we had before.",
+        source: "Trustpilot — Restaurant Group",
+        industry: "Multi-site Restaurant",
+        useWhen: "Competing against a Big 4 bank; prospect is sceptical that savings are real.",
+        tag: "Fee Savings",
+        tagColor: "badge-green",
+      },
+      {
+        id: "t5",
+        quote: "Our operations team was nervous about rolling out new hardware across 3 venues at once. The Shift4 team handled all the configuration remotely and we were live in under a week.",
+        source: "LinkedIn Review — Hotel Group GM",
+        industry: "Hotels / Multi-site",
+        useWhen: "Multi-location prospect worried about implementation complexity.",
+        tag: "Multi-Site Rollout",
+        tagColor: "badge-yellow",
+      },
+    ];
+
+    const QUICK_FACTS = [
+      { label: "AU Market Entry", value: "Acquired Smartpay (AU/NZ) in 2025 for ~$180M USD" },
+      { label: "AU Merchant Base", value: "40,000+ local merchants inherited via Smartpay" },
+      { label: "Core Hardware (AU)", value: "PAX A920 Pro — portable, touchscreen, fast tap response" },
+      { label: "Global Processing", value: "$250B+ processed annually worldwide" },
+      { label: "Uptime SLA", value: "99.999% — sub-5-minute annual downtime target" },
+      { label: "Settlement", value: "Next business day (including weekends)" },
+      { label: "Key Verticals", value: "Hospitality, Hotels, Stadiums (VenueNext), Retail, Trades, Healthcare" },
+      { label: "Surcharging", value: "Legal until 1 Oct 2026 — RBA ban effective then. Use deadline as urgency NOW." },
+      { label: "Free Platform", value: "Shift4Shop eCommerce included at no extra cost" },
+      { label: "Contract Term", value: "No lock-in — 90-day cancellation notice" },
+      { label: "Notable AU Clients", value: "Smartpay portfolio + active expansion in hospitality" },
+      { label: "Support", value: "24/7 technical support + local AU account managers" },
+    ];
+
+    /* ─────────────────────── EXTENDED DATA ─────────────────────────── */
+
+    const BNA_QUESTIONS = [
+      {
+        id: "supplier", number: 1, icon: "🏛️",
+        question: "Who are you currently with for EFTPOS?",
+        why: "Identifies the incumbent and how hard the switch will be. Flags Tyro with clinical software (Medicare integrations) which need compatibility checks.",
+        greenFlags: ["NAB, CommBank, ANZ, Westpac bank terminal", "Square, Zeller, Zettle — less entrenched", "No current provider — blank slate"],
+        redFlags: ["Tyro with Cliniko/Nookal/MindBody — verify Shift4 integration", "Mid-contract with break fees", "Recent 3-year renewal signed"],
+        followUp: "And are you locked in, or are you month-to-month with them?",
+        listen: "Frustration in their voice about the current provider = opening. 'Yeah they're fine' = harder sell — push straight to the bill question.",
+      },
+      {
+        id: "bill", number: 2, icon: "💰",
+        question: "What does your EFTPOS bill look like at the end of the month?",
+        why: "This is your savings anchor. The entire financial case lives here. If they don't know the number, help them find it — that discovery moment is powerful.",
+        greenFlags: [">$300/month = strong ROI case", ">$500/month = high-priority prospect", "They know the exact figure = financially engaged"],
+        redFlags: ["<$100/month = low urgency, weak ROI", "Never looked at the bill = hard to close on financials alone"],
+        followUp: "If they don't know: 'It's usually on your monthly merchant statement or in your Xero bank feed. What's your rough monthly card turnover?'",
+        listen: "When they say 'I had no idea it was that much' — that is your Attention moment. AIDA starts here.",
+      },
+      {
+        id: "terminals", number: 3, icon: "🖥️",
+        question: "How many terminals do you have?",
+        why: "Defines deal size. 1 terminal = small. 3+ = meaningful. 5+ = enterprise onboarding. Also opens the multi-site conversation.",
+        greenFlags: ["3+ terminals = solid deal size", "Multiple locations = expansion opportunity", "About to add terminals = great timing"],
+        redFlags: ["1 terminal, low volume = thin margin", "Long-term hardware lease already in place"],
+        followUp: "Are they all at one location, or across multiple sites?",
+        listen: "'We're about to open another location' = urgency. Diary multi-site prospects for upsell 60 days post-install.",
+      },
+      {
+        id: "pos", number: 4, icon: "💻",
+        question: "Do you have a point of sale system? If so, which one?",
+        why: "Complexity flag. Any POS system means you must verify Shift4 integration BEFORE promising anything. Some integrations are seamless; others are blockers.",
+        greenFlags: ["No POS — standalone terminals only", "Lightspeed, Kounta, H&L, RMS (verified Shift4 integrations)", "Planning to get a POS — guide them"],
+        redFlags: ["Cliniko, Nookal, MindBody — health sector, verify status", "Old proprietary bank system", "'Our POS company handles everything' — may have bundled deal"],
+        followUp: "Is that POS integrated with your EFTPOS, or do they run separately?",
+        listen: "If you don't recognise the POS name, write it down and verify BEFORE your next call. Never guess on integration compatibility.",
+      },
+      {
+        id: "ticketsize", number: 5, icon: "🎟️",
+        question: "What's your average transaction size?",
+        why: "Feeds the surcharging impact calculation. Low ticket ($4 coffee) = surcharge is a few cents = invisible. High ticket ($150 dental) = customer may notice and push back.",
+        greenFlags: ["$5–$40 average = surcharge negligible to customer, easy sell", "$40–$100 = manageable with right framing", "B2B invoicing = large tickets, big savings"],
+        redFlags: ["$150+ avg ticket = customer may push back on surcharge amount", "Very high volume + tiny ticket (e.g., vending) = different conversation"],
+        followUp: "And is that mostly tap-and-go, or do you still have a cash mix?",
+        listen: "Cash-heavy businesses undercount their card costs. Help them see the full picture including cash handling costs.",
+      },
+      {
+        id: "turnover", number: 6, icon: "📈",
+        question: "What's your monthly card turnover roughly?",
+        why: "Calculates the exact dollar saving. Monthly turnover × ~1.5% = current fee spend. That's the number you put in front of them as annual savings.",
+        greenFlags: [">$30k/month = $450+ saved = easy close", ">$100k/month = $1,500+/month = priority account", "'It's been picking up lately' = growing pipeline"],
+        redFlags: ["<$10k/month = <$150/month savings = still worth pitching but weaker", "Seasonal business — get peak month figure, not annual average"],
+        followUp: "Is that pretty consistent, or does it spike in certain seasons?",
+        listen: "Seasonal businesses need to know Shift4 scales at peak. Reassure on uptime and give a peak-month savings calculation.",
+      },
+      {
+        id: "tradingdays", number: 7, icon: "📅",
+        question: "How many days a week do you trade?",
+        why: "Sets up the settlement conversation. Weekend traders are the strongest candidates for next-day settlement pitch vs. banks. Also flags batch timing needs.",
+        greenFlags: ["7 days/week = weekend settlement is a strong sell", "Extended hours (late nights) = batch timing conversation needed", "Saturday/Sunday traders with a bank terminal = golden"],
+        redFlags: ["Mon–Fri 9–5 = less urgency on weekend settlement", "Very few days/week, low volume = weak prospect"],
+        followUp: "And do you trade on weekends? Most banks only settle Saturday's takings on Tuesday — we settle Monday.",
+        listen: "If they trade Saturday AND they're with NAB/CommBank — Tuesday settlement delay is your golden moment.",
+      },
+    ];
+
+    const OBJECTIONS = [
+      {
+        id: "happy", stage: "Early Call", stageBadge: "badge-blue", icon: "😊",
+        objection: "We're happy with our current provider.",
+        reality: "Usually means 'I haven't been given a reason to look'. It's an invitation to create one.",
+        rebuttal: "That's great — a lot of our merchants said the same thing before they saw their monthly bill properly. Can I ask, do you know roughly what you're paying in merchant fees each month? I'm not asking you to switch anything today — I just want to show you a comparison, and you can tell me if it's worth 10 minutes.",
+        doNotSay: ["'You should switch.' — too pushy", "'Your provider is terrible.' — makes them defensive", "'But we're cheaper!' — unsubstantiated"],
+        reengager: "What would have to be different for you to consider a conversation about your EFTPOS?",
+        challengerReframe: "'Happy' is the most expensive word in payments. It means you've stopped questioning a line item that your competitors are actively reducing. What you're comfortable with might be costing you $400–$1,500 a month in fees your customers could be paying instead.",
+        challengeQuestions: [
+          "When did you last look at your merchant statement line by line — not just the total?",
+          "If your provider called you tomorrow and raised your fees 20%, how quickly would you need to know your alternatives?",
+          "What would your accountant say if they found out you were paying $X/month in fees that could legally be passed to the customer?",
+          "Has your provider ever proactively told you about a way to pay less — or does that only happen when you call to complain?",
+        ],
+      },
+      {
+        id: "applied-nodeal", stage: "Re-Engagement", stageBadge: "badge-yellow", icon: "📋",
+        objection: "I applied / enquired before but never followed through.",
+        reality: "GOLD. They showed intent. Something got in the way — time, paperwork, timing. The barrier was logistics, not desire.",
+        rebuttal: "I actually pulled up your file — you did reach out to us a while back. That tells me there was a reason you were interested. What got in the way? I want to make sure we make it easy this time. We've also had a big change since then — the RBA is banning all card surcharges from October. If you want to lock in zero-fee trading before that window closes, now's the time.",
+        doNotSay: ["'Why didn't you go ahead last time?' — makes them defensive", "'Let's start fresh.' — wastes the lead context"],
+        reengager: "If I could handle all the paperwork and make it a 20-minute process, would you want to lock this in before October?",
+        challengerReframe: "You were right the first time. The barrier wasn't the product — it was friction in the process. And while that friction slowed you down, the fees kept running. Let's figure out how much that delay actually cost.",
+        challengeQuestions: [
+          "What changed between when you first enquired and now — have your fees gone up or stayed the same?",
+          "If I told you the time between your first enquiry and today cost you roughly $X in fees you didn't need to pay, would that change how urgently you want to move?",
+          "If I could get you fully set up in a single 20-minute call, what would be the one thing that might still stop you?",
+          "The RBA ban is 6 months away — if you'd switched when you first enquired, how much would you have saved already?",
+        ],
+      },
+      {
+        id: "surcharge-ban", stage: "Mid Call", stageBadge: "badge-red", icon: "⚖️",
+        objection: "I heard surcharging is going away — so what's the point?",
+        reality: "The #1 objection in 2026. They're right. But they're missing: (1) 6 months of savings left, and (2) Shift4's value after October is still strong.",
+        rebuttal: "You're right — and I'm glad you know about it. From October 1st, surcharges on debit and credit cards are banned. That's actually why I'm calling NOW. You have until October to run at zero cost and bank real savings before the rules change. After October, we move to our Simple Flat Rate — and the RBA is also cutting interchange fees at the same time, so your fees will still be lower than today. It's a transition, not a cliff.",
+        doNotSay: ["'Oh that's not happening.' — factually wrong", "'We'll deal with that later.' — dismissive, destroys trust", "Ignoring the objection entirely"],
+        reengager: "Between now and October, how much do you think you'd save? Let me run the number — $X turnover × 1.4% is about $Y a month. That's real money before the law changes.",
+        challengerReframe: "You're focused on what you're losing. Let me show you what your competitors who haven't switched are about to lose — AND what they'll miss during the 6-month window. The businesses that act now bank the savings AND land on the best post-ban flat rate. October is the start of a new landscape, not the end of the value.",
+        challengeQuestions: [
+          "Your competitors who switched 12 months ago have already saved thousands — do you know how much you've left on the table since then by staying put?",
+          "Between now and October — 6 months — what does your monthly card turnover × 1.4% look like? Let me calculate that for you right now.",
+          "After October, the RBA is also cutting interchange fees to their lowest ever level. Are you aware that your flat rate post-ban would actually be lower than what most businesses pay today?",
+          "If the ban wasn't happening, would you have wanted to switch to zero-cost EFTPOS before October? Because that window is still open right now.",
+        ],
+      },
+      {
+        id: "contract", stage: "Mid Call", stageBadge: "badge-yellow", icon: "📄",
+        objection: "We just renewed our contract with [current provider].",
+        reality: "Not a dead end. Get the renewal date. Diary it. Meanwhile look for a beachhead — second terminal, new location.",
+        rebuttal: "Totally understand. Can I ask when that renewal is up? I'd like to put a reminder in to reconnect 60 days before it expires — so you have a real comparison ready. And in the meantime, is there any part of your operation that isn't under that contract? A new location, a pop-up, anything?",
+        doNotSay: ["'You should break the contract.' — never without knowing break fees", "'That's a shame.' — defeatist"],
+        reengager: "When's the end date? And what would have to happen for you to want to switch when it expires?",
+        challengerReframe: "The fact that you just renewed tells me you didn't have an alternative in front of you when you signed. That's worth understanding — because you may have signed something for 12–24 months you could have negotiated differently if you'd had this conversation first. Let's at least understand exactly what you're locked into.",
+        challengeQuestions: [
+          "Is the break fee actually written into the agreement — and is it a fixed fee or a penalty based on remaining months?",
+          "Did they give you a better rate at renewal, or essentially the same terms as before?",
+          "Is your entire operation locked in, or just the specific terminals — if you opened a second location, would you have flexibility there?",
+          "At the time you renewed, were you aware the RBA was about to ban surcharging? That's a material change to your payments landscape — worth a conversation with your current provider about terms.",
+        ],
+      },
+      {
+        id: "staff-training", stage: "Mid Call", stageBadge: "badge-blue", icon: "👥",
+        objection: "I don't want to retrain my staff on new equipment.",
+        reality: "Legitimate concern in hospitality. Reframe by minimising training burden — the PAX A920 Pro is intuitive.",
+        rebuttal: "Completely fair — the last thing you want is your team fumbling with a new terminal on a Friday night. The PAX A920 Pro is a touchscreen — your staff figure it out in 20 minutes. We configure it remotely so it arrives ready out of the box. How long did it take your team to get comfortable with your current terminal when you first got it?",
+        doNotSay: ["'Training is easy.' — dismissive", "'It's just a terminal.' — undersells the transition concern"],
+        reengager: "Can I show you a 90-second clip of what the checkout flow looks like for a customer?",
+        challengerReframe: "Your current terminal had a learning curve too — you just don't remember it anymore. The real question is: what's 20 minutes of training per staff member actually worth in dollar terms versus what you're saving in fees every single month? Let's run that calculation.",
+        challengeQuestions: [
+          "How long did it actually take your staff to get comfortable with your current terminal when you first installed it?",
+          "If the training cost was 1 hour of your team's time one-time, and the saving was $500/month — is that a trade-off you'd consider?",
+          "Has your current terminal ever slowed service because it's older, slower, or locked up during a rush?",
+          "We configure the PAX A920 Pro remotely before it arrives — it comes ready to use. Would seeing a 60-second demo of the checkout flow change your view on the complexity?",
+        ],
+      },
+      {
+        id: "need-to-think", stage: "Close", stageBadge: "badge-purple", icon: "🤔",
+        objection: "I need to think about it / I'll call you back.",
+        reality: "Classic stall. Usually means an unresolved objection they didn't voice. Surface it gently — don't push harder.",
+        rebuttal: "Of course — this is a real decision. Before I let you go, can I ask: is there a specific part of what I've shared that doesn't feel right? I'd rather address it now than have you sit on something that could be easily cleared up.",
+        doNotSay: ["'When should I call you back?' — gets a fake date", "'I'll send you our brochure.' — cold follow-up graveyard", "Fake urgency like 'this offer expires Friday'"],
+        reengager: "What's the one thing that would make you confident enough to say yes today?",
+        challengerReframe: "'I need to think about it' is a decision to keep paying what you're paying. Every month of thinking has a dollar value. Let's make that visible right now, because the clock on the October window doesn't pause while you're deciding.",
+        challengeQuestions: [
+          "What specifically would you need to feel confident right now — is it the rate, the contract terms, the technology, or something I haven't addressed?",
+          "If you take 3 months to decide, what does that cost you in fees you're paying between now and then?",
+          "Is there someone else in the business who needs to be part of this conversation — because I'd rather speak to them directly than have you relay it second-hand.",
+          "What's the worst-case scenario if you move forward and it doesn't work as expected — and what's your actual risk given there's no lock-in?",
+        ],
+      },
+      {
+        id: "accountant", stage: "Close", stageBadge: "badge-purple", icon: "📊",
+        objection: "I need to speak to my accountant / business partner first.",
+        reality: "Legitimate. Also used as a delay. Make them the hero in that conversation by arming them with a summary to share.",
+        rebuttal: "Absolutely — that's smart. Let me make that conversation easy. Can I send you a one-page summary of what we discussed, including the savings calculation and how the October surcharging change affects you? When do you think you'll have that chat?",
+        doNotSay: ["'Do you need their approval?' — condescending", "'Can we get them on a call now?' — too aggressive"],
+        reengager: "Would it help if I spoke to them directly? Accountants often appreciate knowing about the RBA changes because it affects their clients' P&L.",
+        challengerReframe: "Smart call — your accountant cares about one thing: the P&L. The RBA reform is actually something they should already be briefing you on. The fact that they haven't is a gap. Let me give you the one number that makes their sign-off straightforward.",
+        challengeQuestions: [
+          "Is the key thing they'd need to see the monthly saving, the contract terms, or both — so I can prepare the right summary for that conversation?",
+          "Has your accountant given you any guidance on how the RBA surcharging ban affects your cost structure? If not, they may not be across it yet.",
+          "Would it be useful for me to send them a direct note about the regulatory change — accountants appreciate a heads-up on material changes to their clients' P&L.",
+          "If we could get them on a 10-minute call together — you, me, and them — would that move the decision faster than you relaying the details?",
+        ],
+      },
+      {
+        id: "competitor-rate", stage: "Close", stageBadge: "badge-red", icon: "🏷️",
+        objection: "Your competitor offered us a better rate.",
+        reality: "Get specific. 'Better rate' is vague. Compare apples to apples — surcharging makes Shift4's rate effectively zero.",
+        rebuttal: "I'd like to understand that — what rate were you quoted, and how is it structured? Flat per transaction, or a percentage you absorb? Because if you're comparing 1.4% with surcharging vs. a flat fee you eat yourself, those are completely different things. Can you send me the quote they gave you?",
+        doNotSay: ["'They're lying.' — never", "'We'll match it.' — without knowing the full structure", "Dismissing the quote without understanding it"],
+        reengager: "If I can show you the comparison line by line and we come out better, would that be enough to move forward?",
+        challengerReframe: "Let me challenge the comparison itself. Are you comparing the merchant fee (what you pay) or the effective rate (what it costs the business after the customer absorbs it)? A 0% merchant fee with surcharging versus a 1.1% flat fee you eat yourself — those are completely different numbers dressed up to look similar.",
+        challengeQuestions: [
+          "Is the rate they quoted one where you absorb the fee, or does the customer pay it? Because that's the difference between 1.4% and 0%.",
+          "Did they quote you the same rate for EFTPOS, Visa debit, and Mastercard credit — or do they charge different rates for different card types?",
+          "What do they charge if you exceed a monthly volume threshold — are there tiered rates or penalties in the fine print?",
+          "That quote — does it include the terminal rental, the monthly service fee, and the PCI compliance fee, or is that a processing rate only? Get the total cost, not just the transaction rate.",
+        ],
+      },
+      {
+        id: "outage-fear", stage: "Mid Call", stageBadge: "badge-red", icon: "⚡",
+        objection: "What happens if the terminal goes down during a busy period?",
+        reality: "Legitimate — especially post-Tyro 2022 outage. Lead with facts. Offer the concrete support pathway.",
+        rebuttal: "That's exactly the right question — especially if you've been on Tyro. Their 2022 outage hit 35,000 venues on a Saturday. Our uptime target is 99.999% — less than 5 minutes of downtime per year. If something does go wrong, you call a local AU support number staffed 24/7. There's also an offline mode for short periods. Have you experienced a downtime incident with your current provider?",
+        doNotSay: ["'That won't happen.' — can't guarantee", "'All terminals go down sometimes.' — defeatist"],
+        reengager: "Tell me about the last time your current terminal went down. What happened?",
+        challengerReframe: "You're asking the right question — but you might be asking it about the wrong provider. The Tyro 2022 outage knocked out 35,000 businesses across AU on a Saturday night. The cost wasn't the missed transactions — it was the customers who walked. Uptime risk is real. Let me show you how to evaluate it properly rather than just taking a provider's word for it.",
+        challengeQuestions: [
+          "When did your terminal last go down — and what did that actually cost you in lost sales, cash-only scramble, or customer walkouts?",
+          "Does your current provider have a 24/7 local AU support number — and have you ever needed to call them outside of 9–5 business hours?",
+          "If I could show you the actual uptime SLA in our contract — 99.999%, less than 5 minutes downtime per year — and compare it to your current provider's SLA, would that shift your view?",
+          "What's your backup plan right now if your terminal dies on a Friday at 8pm? I want to understand how much risk you're already carrying.",
+        ],
+      },
+    ];
+
+    const CHALLENGER_MINDSET = {
+      principle: "The best reps don't defend their product — they reframe the prospect's thinking. Every complaint is a teaching opportunity. Teach something they didn't know. Tailor it to their specific situation. Then take control and lead to a decision.",
+      moves: [
+        { label: "Teach", icon: "📚", color: "#60a5fa", description: "Give them an insight they couldn't have found without you. The surcharging ban, the cost of inaction, the competitor who already switched. Be the most informed person in that conversation." },
+        { label: "Tailor", icon: "🎯", color: "#4ade80", description: "Make the insight specific to THEIR situation — their monthly turnover, their industry, their current provider. Generic insight is interesting. Personalised insight is compelling." },
+        { label: "Take Control", icon: "🧭", color: "#fbbf24", description: "Lead them to a next step. Not 'I'll send a brochure'. A specific ask: 'Can I run the numbers right now?' or 'Let's get your accountant on a 10-minute call.' Challengers drive decisions." },
+      ],
+      universalQuestions: [
+        "What would staying exactly as you are cost you over the next 12 months — in fees, in lost flexibility, in missed savings?",
+        "Is there anything about your current setup that, if you're honest, you'd change if you could?",
+        "If this decision were yours alone and you had to make it today, what would you do?",
+        "What does your most successful competitor in this industry do differently with their payment setup?",
+        "What's the worst-case scenario if you switch — and what's the actual probability of that happening given there's no lock-in?",
+      ],
+    };
+
+    const LOST_LEADS_DATA = {
+      whyTheyFell: [
+        { icon: "📝", reason: "Paperwork friction", detail: "Applied but the signup process felt like too much work. Life got in the way. They are still interested — the barrier was logistics, not desire." },
+        { icon: "⏰", reason: "Timing clash", detail: "Enquired during their busiest season (Christmas, EOFY) and couldn't risk disruption. Come back in January or July — quieter periods invite change." },
+        { icon: "👤", reason: "Decision-maker unavailable", detail: "The person who called wasn't the final decision-maker. They went back to get sign-off and nothing happened. Always qualify who the decision-maker is on the first call." },
+        { icon: "😴", reason: "Incumbent inertia", detail: "Unhappy but not unhappy enough. The daily pain wasn't acute enough to justify switching effort. The surcharging ban is now your new urgency trigger." },
+        { icon: "🏃", reason: "Competitor moved faster", detail: "Another provider called them back sooner and closed them. Speed matters — old inbound degrades fast. Same-day callbacks on all inbound are non-negotiable." },
+        { icon: "❓", reason: "Product confusion", detail: "Surcharging sounded 'too good to be true'. They needed education, not more pressure. The next call should open with education, not a pitch." },
+      ],
+      scripts: [
+        { age: "0–3 months", label: "Recent Inbound", badgeColor: "badge-green", script: "\"Hi [Name], this is [Rep] from Shift4 — you actually reached out to us a few months back about EFTPOS. I wanted to make sure we didn't drop the ball on your end. Are you still looking, or has something changed?\"", notes: "Keep it warm and apologetic. Assume it was Shift4's fault the follow-up didn't happen." },
+        { age: "3–9 months", label: "Warm Lead", badgeColor: "badge-yellow", script: "\"Hi [Name], this is [Rep] from Shift4, formerly Smartpay. You enquired with us some time back. I'm calling because there's been a significant change in Australian payments — the RBA is banning all card surcharges from October 2026. I wanted to make sure you knew about it and had a chance to lock in zero-cost EFTPOS before the window closes. Do you have 5 minutes?\"", notes: "The RBA change is a legitimate new reason to call old leads. It's a real news event — use it." },
+        { age: "9–18 months", label: "Cold Reactivation", badgeColor: "badge-red", script: "\"Hi [Name], long shot — you reached out to Shift4 about 18 months ago. I know it's been a while, things may have changed. But I'm calling because there's something happening in October that every business owner in Australia needs to know about. Is now an okay time for 2 minutes?\"", notes: "Don't lead with the product. Lead with the news event. Get the conversation started, then qualify fresh." },
+      ],
+      aida: [
+        { phase: "A", label: "ATTENTION", color: "#3b82f6", goal: "Stop the pattern. Don't sound like a telemarketer.", script: "\"Hi [Name], quick question before I say anything else: do you know how much you're paying in EFTPOS fees each month?\"", why: "A direct question forces engagement. It's not a pitch — it's a question they haven't thought about. That pause is your opening.", doNot: "Don't open with 'I'm calling today about our great EFTPOS solutions.' You'll be hung up on in 4 seconds." },
+        { phase: "I", label: "INTEREST", color: "#8b5cf6", goal: "Make them feel the pain in dollar terms using their own BNA answers.", script: "\"You're paying about $X/month in merchant fees. Over a year that's $Y. With Shift4 surcharging, that becomes $0 — the fee passes to the customer automatically. It's legal, it's automatic, and most customers don't notice it on a $40 restaurant bill.\"", why: "Use their exact numbers. Personalised = believable. Generic = salesy.", doNot: "Don't go straight to features. Nobody cares about the hardware until they care about the cost." },
+        { phase: "D", label: "DESIRE", color: "#f59e0b", goal: "Create urgency using the October deadline — real, not manufactured.", script: "\"The reason I'm calling now specifically is the RBA announcement. From October 1st 2026, surcharges on debit and credit cards are banned in Australia. So the window to run at zero cost is closing. Businesses that switch before October lock in the maximum benefit. After October, fees will still be lower than today because the RBA is cutting interchange too — but zero-cost EFTPOS ends.\"", why: "October 1 is a hard external deadline. Use it honestly. It's compelling enough — don't inflate it.", doNot: "Never use fake urgency like 'this offer expires Friday'. The real deadline is powerful enough." },
+        { phase: "A", label: "ACTION", color: "#10b981", goal: "Don't ask for 'yes to switching'. Ask for yes to the next small step.", script: "\"Here's what I'd suggest — let me put together a quick savings summary based on what you've told me. It takes me five minutes and shows you exactly what you'd save before October versus after. Can I send that through to your email? Then you look at the numbers, share it with whoever else you need to, and we go from there. Fair enough?\"", why: "'Can I send you a document?' is a much lower-commitment ask. Start momentum with a micro-yes.", doNot: "Don't close with 'So would you like to sign up today?' on the first call. Ask for a document send, a follow-up call, or an accountant introduction." },
+      ],
+      consistency: [
+        { rule: "Always say 'Shift4', not 'Smartpay'", reason: "Smartpay is the old brand. Shift4 is a global company. Every time you say Smartpay you undersell the scale of who you work for." },
+        { rule: "Never quote a specific rate without manager confirmation", reason: "Rate quoting is a compliance issue. Give ranges: 'Based on your volume, it'll look something like X — your account manager confirms the exact figure.'" },
+        { rule: "Always end with a specific next step, never 'I'll be in touch'", reason: "'I'll be in touch' gives them an out. 'I'll send the summary by 5pm and follow up Thursday' keeps you in control." },
+        { rule: "Never lead with badmouthing competitors — let the prospect bring them up", reason: "If you say 'Tyro are terrible' first, you sound unprofessional. When they mention Tyro, say: 'Tyro is popular — let me show you how we compare on what matters to you.'" },
+        { rule: "Never promise POS integration without verifying", reason: "One broken promise on a POS integration destroys trust. Say 'I'll confirm that for you' — never guess." },
+        { rule: "If they say no, always ask for a referral", reason: "Even a dead deal can produce a warm referral. 'Is there anyone else in your industry who might find this useful?' costs nothing." },
+      ],
+    };
+
+    const SURCHARGE_INTEL = {
+      deadline: "1 October 2026",
+      urgencyBanner: "⚠️ 6-MONTH WINDOW — surcharging banned from October 1. Use this deadline on every call.",
+      summary: "The RBA has formally banned surcharges on all eftpos, Mastercard, and Visa debit and credit cards. From 1 October 2026, merchants cannot charge customers a checkout surcharge. American Express is not covered by this regulation.",
+      timeline: [
+        { date: "April 2026 (NOW)", badge: "badge-green", event: "6-month window open. Merchants who switch now get maximum benefit from surcharging before the ban.", action: "Create urgency — use this on every call." },
+        { date: "1 October 2026", badge: "badge-red", event: "Surcharging ban takes effect. Zero Cost EFTPOS ends. Simple Flat Rate becomes the primary product.", action: "Pivot pitch to settlement speed, interchange savings, hardware quality, and local support." },
+        { date: "1 April 2027", badge: "badge-yellow", event: "Additional reforms: interchange cap on foreign cards + enhanced fee transparency requirements.", action: "Show the AU payment landscape is actively improving — Shift4 is ahead of the curve." },
+      ],
+      whatChanges: [
+        "Surcharging on eftpos, Visa, and Mastercard debit/credit cards is banned from 1 Oct 2026",
+        "Interchange fee cap on debit reduces from 0.2% → 0.16% (saves merchants ~$910M/year industry-wide)",
+        "RBA will publish merchant fee data publicly — easier for merchants to shop around",
+      ],
+      whatDoesntChange: [
+        "American Express surcharging NOT banned — check current Amex rules separately",
+        "BPAY and non-card payment surcharges not affected",
+        "Terminal and access fees are not directly impacted",
+        "Next-day settlement advantage remains — permanently",
+        "No lock-in contract — stays 90-day notice",
+      ],
+      postBanPitch: [
+        { icon: "⚡", prop: "Next-Day Settlement", detail: "Banks still delay weekend settlement. Shift4 settles Monday for Saturday trading. Permanent cash flow advantage." },
+        { icon: "📊", prop: "Lowest Flat Rate", detail: "RBA cutting interchange means base costs drop industry-wide. Shift4's Simple Flat Rate is benchmarked to new lower rates." },
+        { icon: "🖥️", prop: "Superior Hardware", detail: "PAX A920 Pro is faster and more capable than bank terminals. This is a technology conversation, not a pricing one." },
+        { icon: "🛎️", prop: "24/7 Local AU Support", detail: "Banks give you a call centre. Shift4 gives you a local account manager. Critical when the terminal dies at 9pm Saturday." },
+        { icon: "📈", prop: "Business Intelligence Dashboard", detail: "Real-time reporting, Z-reports, multi-site view. Banks give a printed statement. Shift4 gives a business intelligence tool." },
+        { icon: "🔓", prop: "No Lock-In", detail: "Banks lock you in for 3 years. Shift4 is 90-day notice. That flexibility doesn't change after October." },
+      ],
+      handleObjection: "\"You're right — surcharging ends October 1. Here's what I want you to understand: between now and October, you could save $X in fees. And after October, the RBA is also cutting interchange fees — so your base rate will still be lower than what you're paying today with [current provider]. It's not a cliff, it's a transition. You're better off being on Shift4's platform when that transition happens.\"",
+      products: [
+        { name: "Zero Cost™ EFTPOS", active: true, until: "Until 1 Oct 2026", description: "Surcharging passes the card fee to the customer. Effective merchant fee = $0.", pitch: "Lead product until September 2026. Create urgency around the October deadline." },
+        { name: "Simple Flat Rate", active: true, until: "Permanent (primary post-Oct 2026)", description: "One transparent, competitive flat rate per transaction. No hidden fees, no tiered pricing complexity.", pitch: "Offer for merchants who don't want surcharging, or as the primary product after October." },
+      ],
+    };
+
+    /* ─────────────────────────── COACHING DATA ─────────────────────── */
+
+    const BREAK_SUGGESTIONS = [
+      { icon: "🚶", action: "Go for a 10-minute walk", detail: "Movement literally resets your nervous system. Even around the block." },
+      { icon: "💧", action: "Get a glass of water", detail: "Then stand somewhere you can see outside for 5 minutes. Natural light resets your mood." },
+      { icon: "🌬️", action: "Three slow deep breaths", detail: "Inhale 4 counts, hold 4, exhale 6. Do it 3 times. It sounds simple because it is — and it works." },
+      { icon: "✍️", action: "Write down 3 wins from today", detail: "Specifics only. 'I handled the surcharge objection well on call 2' — not 'I did okay'. Your brain needs evidence." },
+      { icon: "🍌", action: "Grab a snack", detail: "Low blood sugar kills your tonality more than any objection. Fuel up before your next block." },
+      { icon: "📱", action: "Text someone who gives you energy", detail: "Even 2 minutes of a positive conversation resets the emotional frame entirely." },
+      { icon: "🧍", action: "Stand up and reset your posture", detail: "Roll your shoulders back, lift your chin. You literally sound different when you sit differently. Your body language affects your vocal tone even on the phone." },
+      { icon: "🎵", action: "One song that makes you feel unstoppable", detail: "Then pick up the phone. Pre-call state is everything. You choose your energy." },
+    ];
+
+    const STREAK_MESSAGES = [
+      { streak: 2, message: "Two tough ones in a row — happens to every rep. You're still in the game.", colour: "#fbbf24" },
+      { streak: 3, message: "Three is the reset number. This is not a slide — this is a signal to pause and come back stronger.", colour: "#f87171" },
+      { streak: 4, message: "Four straight is rare and you're through it. The next call is a completely clean slate.", colour: "#f87171" },
+      { streak: 5, message: "Five calls takes grit to push through. You have it. But right now, your energy needs a reset — not more calls.", colour: "#ef4444" },
+    ];
+
+    const SKILL_DRILLS = {
+      opener:     { label: "Opening Strength", tab: "lostleads", section: "aida", drill: "Your opener scores are pulling your average down. Head to Lost Leads → AIDA Framework and practise the Attention script until it feels natural." },
+      confidence: { label: "Confidence on Calls", tab: "lostleads", section: "consistency", drill: "Confidence drops often mean you're unsure of the product or the process. Review the On-Brand Rules — knowing what to always say takes the guesswork out." },
+      rapport:    { label: "Building Rapport", tab: "bna", section: null, drill: "Low rapport scores usually mean calls are too scripted. Open the BNA tab and practise the listening cues — rapport builds when prospects feel genuinely heard." },
+    };
+
+    const STAGE_GUIDANCE = {
+      opener:    { label: "Opener / Attention", tab: "lostleads", tip: "Calls are dying before you get started. The opener isn't landing. Go back to AIDA — the Attention script — and refine the cold open question." },
+      bna:       { label: "BNA / Qualifying", tab: "bna", tip: "Prospects are dropping out during qualifying. They may feel interrogated. Soften the BNA questions — make them conversational, not a checklist." },
+      pitch:     { label: "Pitch / Interest", tab: "lostleads", tip: "Interest isn't building. Check that you're using their exact numbers, not generic ones. Personalised = believable. Generic = salesy." },
+      objection: { label: "Objection Handling", tab: "objections", tip: "Most losses are happening at the objection stage. Open the Objections tab and run through the rebuttals for your top objection before the next block." },
+      close:     { label: "Closing", tab: "lostleads", tip: "You're getting deep into calls but not converting. Review the Action phase of AIDA — make sure your next step is small and reversible, not 'do you want to sign up?'" },
+    };
+
+    /* ─────────────────────────── COMPONENTS ─────────────────────────── */
+
+    const TABS = [
+      { id: "industries", label: "Industries", icon: "🏭" },
+      { id: "battlecards", label: "Battle Cards", icon: "⚔️" },
+      { id: "bna", label: "BNA + Qualifying", icon: "📋" },
+      { id: "objections", label: "Objections", icon: "🎯" },
+      { id: "lostleads", label: "Lost Leads", icon: "🔄" },
+      { id: "surcharge", label: "Surcharge Intel", icon: "📈" },
+      { id: "incentives", label: "Incentives", icon: "💡" },
+      { id: "social", label: "Social Proof", icon: "⭐" },
+      { id: "facts", label: "Quick Facts", icon: "📊" },
+      { id: "coaching", label: "Coaching", icon: "🧠" },
+    ];
+
+    function SearchBar({ value, onChange, placeholder }) {
+      return (
+        <div style={{ position: "relative", marginBottom: 20 }}>
+          <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", fontSize: 16 }}>🔍</span>
+          <input
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            placeholder={placeholder}
+            style={{
+              width: "100%", padding: "12px 16px 12px 42px", background: "#1a1d27",
+              border: "1px solid #2d3748", borderRadius: 10, color: "#e2e8f0",
+              fontSize: 14, outline: "none", transition: "border-color .2s",
+            }}
+            onFocus={e => e.target.style.borderColor = "#3b82f6"}
+            onBlur={e => e.target.style.borderColor = "#2d3748"}
+          />
+        </div>
+      );
+    }
+
+    function Card({ children, style }) {
+      return (
+        <div style={{
+          background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 14,
+          padding: 20, marginBottom: 16, ...style,
+        }}>
+          {children}
+        </div>
+      );
+    }
+
+    function Label({ text, color = "#94a3b8" }) {
+      return <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", color }}>{text}</span>;
+    }
+
+    function IndustryView() {
+      const [search, setSearch] = useState("");
+      const [expanded, setExpanded] = useState(null);
+
+      const filtered = useMemo(() =>
+        INDUSTRIES.filter(i =>
+          `${i.name} ${i.target} ${i.useCase}`.toLowerCase().includes(search.toLowerCase())
+        ), [search]);
+
+      return (
+        <div>
+          <SearchBar value={search} onChange={setSearch} placeholder="Search industry, target, use case..." />
+          {filtered.map(ind => (
+            <Card key={ind.id}>
+              <div
+                onClick={() => setExpanded(expanded === ind.id ? null : ind.id)}
+                style={{ cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 12 }}
+              >
+                <span style={{ fontSize: 28 }}>{ind.icon}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                    <h3 style={{ fontSize: 17, fontWeight: 700, color: "#f1f5f9" }}>{ind.name}</h3>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <span className="tag badge-blue">⏱ {ind.callTime}</span>
+                      <span style={{ color: "#64748b", fontSize: 18 }}>{expanded === ind.id ? "▲" : "▼"}</span>
+                    </div>
+                  </div>
+                  <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 4 }}>🎯 {ind.target}</p>
+                  <p style={{ color: "#64748b", fontSize: 12, marginTop: 2 }}>Revenue range: {ind.annualRevenue}</p>
+                </div>
+              </div>
+
+              {expanded === ind.id && (
+                <div style={{ marginTop: 18, display: "grid", gap: 14 }}>
+                  <div>
+                    <Label text="Call Type" color="#60a5fa" />
+                    <p style={{ color: "#cbd5e1", fontSize: 13, marginTop: 6 }}>{ind.callType}</p>
+                  </div>
+                  <div>
+                    <Label text="Use Case / Pitch" color="#4ade80" />
+                    <p style={{ color: "#cbd5e1", fontSize: 13, marginTop: 6 }}>{ind.useCase}</p>
+                  </div>
+                  <div style={{ background: "#0f3460", border: "1px solid #1e3a5f", borderRadius: 10, padding: 12 }}>
+                    <Label text="Opening Hook" color="#93c5fd" />
+                    <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 6, fontStyle: "italic" }}>{ind.hook}</p>
+                  </div>
+                  <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 10, padding: 12 }}>
+                    <Label text="⚠️ Reconciliation Watch-Out" color="#fbbf24" />
+                    <p style={{ color: "#fde68a", fontSize: 13, marginTop: 6 }}>{ind.reconciliation}</p>
+                  </div>
+                  <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 10, padding: 12 }}>
+                    <Label text="🛑 Why They Don't Buy" color="#f87171" />
+                    <ul style={{ color: "#fca5a5", fontSize: 13, marginTop: 6, paddingLeft: 16 }}>
+                      {ind.rejection.map((r, i) => <li key={i} style={{ marginBottom: 4 }}>{r}</li>)}
+                    </ul>
+                  </div>
+                  <div>
+                    <Label text="🔄 Pivot / Alternative" color="#c084fc" />
+                    <p style={{ color: "#e9d5ff", fontSize: 13, marginTop: 6 }}>{ind.pivot}</p>
+                  </div>
+                  <div>
+                    <Label text="🚫 When to Walk Away" color="#94a3b8" />
+                    <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 6, fontStyle: "italic" }}>{ind.altTarget}</p>
+                  </div>
+                  <div>
+                    <Label text="✅ Buyer Signals" color="#4ade80" />
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                      {ind.buyerSignals.map((s, i) => (
+                        <span key={i} className="tag badge-green">{s}</span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          ))}
+        </div>
+      );
+    }
+
+    function BattleCardsView() {
+      const [search, setSearch] = useState("");
+      const [expanded, setExpanded] = useState(null);
+
+      const filtered = useMemo(() =>
+        BATTLE_CARDS.filter(b =>
+          `${b.competitor} ${b.summary}`.toLowerCase().includes(search.toLowerCase())
+        ), [search]);
+
+      return (
+        <div>
+          <SearchBar value={search} onChange={setSearch} placeholder="Search competitor..." />
+          {filtered.map(bc => (
+            <Card key={bc.id}>
+              <div
+                onClick={() => setExpanded(expanded === bc.id ? null : bc.id)}
+                style={{ cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 12 }}
+              >
+                <span style={{ fontSize: 28 }}>{bc.icon}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <h3 style={{ fontSize: 17, fontWeight: 700, color: "#f1f5f9" }}>vs. {bc.competitor}</h3>
+                    <span style={{ color: "#64748b", fontSize: 18 }}>{expanded === bc.id ? "▲" : "▼"}</span>
+                  </div>
+                  <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 4 }}>{bc.summary}</p>
+                </div>
+              </div>
+
+              {expanded === bc.id && (
+                <div style={{ marginTop: 18, display: "grid", gap: 14 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div style={{ background: "#052e16", border: "1px solid #14532d", borderRadius: 10, padding: 12 }}>
+                      <Label text="Their Strengths" color="#4ade80" />
+                      <ul style={{ color: "#bbf7d0", fontSize: 13, marginTop: 6, paddingLeft: 16 }}>
+                        {bc.strengths.map((s, i) => <li key={i} style={{ marginBottom: 4 }}>{s}</li>)}
+                      </ul>
+                    </div>
+                    <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 10, padding: 12 }}>
+                      <Label text="Their Weaknesses" color="#f87171" />
+                      <ul style={{ color: "#fca5a5", fontSize: 13, marginTop: 6, paddingLeft: 16 }}>
+                        {bc.weaknesses.map((w, i) => <li key={i} style={{ marginBottom: 4 }}>{w}</li>)}
+                      </ul>
+                    </div>
+                  </div>
+                  <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14 }}>
+                    <Label text="💬 Counter-Script (say this)" color="#93c5fd" />
+                    <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 8, lineHeight: 1.65, fontStyle: "italic" }}>"{bc.counterScript}"</p>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div>
+                      <Label text="✅ Win When" color="#4ade80" />
+                      <p style={{ color: "#cbd5e1", fontSize: 13, marginTop: 6 }}>{bc.winWhen}</p>
+                    </div>
+                    <div>
+                      <Label text="⚠️ Lose To Them When" color="#fbbf24" />
+                      <p style={{ color: "#fde68a", fontSize: 13, marginTop: 6 }}>{bc.loseTo}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          ))}
+        </div>
+      );
+    }
+
+    function IncentivesView() {
+      const [expanded, setExpanded] = useState(null);
+      return (
+        <div>
+          <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 20 }}>
+            These are your closes. Know them cold — use them in the order the prospect's pain presents.
+          </p>
+          {INCENTIVES.map(inc => (
+            <Card key={inc.id}>
+              <div
+                onClick={() => setExpanded(expanded === inc.id ? null : inc.id)}
+                style={{ cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 12 }}
+              >
+                <span style={{ fontSize: 28 }}>{inc.icon}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <h3 style={{ fontSize: 17, fontWeight: 700, color: "#f1f5f9" }}>{inc.title}</h3>
+                    <span style={{ color: "#64748b", fontSize: 18 }}>{expanded === inc.id ? "▲" : "▼"}</span>
+                  </div>
+                  <p style={{ color: "#4ade80", fontSize: 13, marginTop: 4, fontWeight: 600 }}>{inc.tagline}</p>
+                </div>
+              </div>
+              {expanded === inc.id && (
+                <div style={{ marginTop: 16, display: "grid", gap: 14 }}>
+                  <div>
+                    <Label text="What It Is" color="#94a3b8" />
+                    <p style={{ color: "#cbd5e1", fontSize: 13, marginTop: 6 }}>{inc.detail}</p>
+                  </div>
+                  <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14 }}>
+                    <Label text="💬 Script" color="#93c5fd" />
+                    <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 8, fontStyle: "italic", lineHeight: 1.65 }}>{inc.script}</p>
+                  </div>
+                  <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 10, padding: 12 }}>
+                    <Label text="⚠️ Caveats / Watch-outs" color="#fbbf24" />
+                    <p style={{ color: "#fde68a", fontSize: 13, marginTop: 6 }}>{inc.caveats}</p>
+                  </div>
+                </div>
+              )}
+            </Card>
+          ))}
+        </div>
+      );
+    }
+
+    function SocialProofView() {
+      const [search, setSearch] = useState("");
+      const filtered = useMemo(() =>
+        TESTIMONIALS.filter(t =>
+          `${t.quote} ${t.industry} ${t.useWhen}`.toLowerCase().includes(search.toLowerCase())
+        ), [search]);
+
+      return (
+        <div>
+          <SearchBar value={search} onChange={setSearch} placeholder="Search by industry or situation..." />
+          {filtered.map(t => (
+            <Card key={t.id}>
+              <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+                <span className={`tag ${t.tagColor}`}>{t.tag}</span>
+                <span style={{ color: "#64748b", fontSize: 12 }}>{t.industry}</span>
+              </div>
+              <p style={{ color: "#e2e8f0", fontSize: 15, lineHeight: 1.7, fontStyle: "italic" }}>
+                "{t.quote}"
+              </p>
+              <p style={{ color: "#60a5fa", fontSize: 12, marginTop: 10, fontWeight: 600 }}>— {t.source}</p>
+              <div style={{ marginTop: 14, background: "#052e16", border: "1px solid #14532d", borderRadius: 8, padding: 10 }}>
+                <Label text="Use When" color="#4ade80" />
+                <p style={{ color: "#bbf7d0", fontSize: 13, marginTop: 4 }}>{t.useWhen}</p>
+              </div>
+            </Card>
+          ))}
+        </div>
+      );
+    }
+
+    function QuickFactsView() {
+      return (
+        <div>
+          <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 20 }}>
+            Know these cold before every call. These are your credibility anchors.
+          </p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12 }}>
+            {QUICK_FACTS.map((f, i) => (
+              <div key={i} style={{
+                background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 12, padding: 16,
+              }}>
+                <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px" }}>{f.label}</p>
+                <p style={{ color: "#f1f5f9", fontSize: 15, fontWeight: 600, marginTop: 6 }}>{f.value}</p>
+              </div>
+            ))}
+          </div>
+          <Card style={{ marginTop: 20, borderColor: "#1e3a5f", background: "#0c1a2e" }}>
+            <Label text="Export to CSV for AppSheet" color="#60a5fa" />
+            <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 8 }}>
+              Click the button below to download a CSV of all industry and battle card data — paste it into Google Sheets and connect AppSheet in one click.
+            </p>
+            <button
+              onClick={exportCSV}
+              style={{
+                marginTop: 12, background: "#2563eb", color: "#fff", border: "none",
+                borderRadius: 8, padding: "10px 20px", fontSize: 14, fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              ⬇ Download CSV for AppSheet
+            </button>
+          </Card>
+        </div>
+      );
+    }
+
+    /* ──────────────────────── NEW VIEW COMPONENTS ─────────────────── */
+
+    function BNAView() {
+      const [expanded, setExpanded] = useState(null);
+      return (
+        <div>
+          <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 12, padding: 16, marginBottom: 20 }}>
+            <p style={{ color: "#93c5fd", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>How to use this framework</p>
+            <p style={{ color: "#94a3b8", fontSize: 13, lineHeight: 1.7 }}>
+              Run through all 7 questions in order. The answers feed directly into your AIDA close (Lost Leads tab). Listen for green flags = accelerate. Red flags = acknowledge and pivot. Always end with a specific next step.
+            </p>
+          </div>
+          {BNA_QUESTIONS.map(q => (
+            <Card key={q.id}>
+              <div onClick={() => setExpanded(expanded === q.id ? null : q.id)} style={{ cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 12 }}>
+                <div style={{ width: 32, height: 32, background: "#1e3a5f", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 800, color: "#60a5fa", flexShrink: 0 }}>
+                  {q.number}
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <h3 style={{ fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>{q.icon} {q.question}</h3>
+                    <span style={{ color: "#64748b", fontSize: 18 }}>{expanded === q.id ? "▲" : "▼"}</span>
+                  </div>
+                </div>
+              </div>
+              {expanded === q.id && (
+                <div style={{ marginTop: 16, display: "grid", gap: 12 }}>
+                  <div>
+                    <Label text="Why ask this" color="#94a3b8" />
+                    <p style={{ color: "#cbd5e1", fontSize: 13, marginTop: 6 }}>{q.why}</p>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div style={{ background: "#052e16", border: "1px solid #14532d", borderRadius: 10, padding: 12 }}>
+                      <Label text="✅ Green Flags" color="#4ade80" />
+                      <ul style={{ color: "#bbf7d0", fontSize: 13, marginTop: 6, paddingLeft: 16 }}>
+                        {q.greenFlags.map((f, i) => <li key={i} style={{ marginBottom: 4 }}>{f}</li>)}
+                      </ul>
+                    </div>
+                    <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 10, padding: 12 }}>
+                      <Label text="🚩 Red Flags" color="#f87171" />
+                      <ul style={{ color: "#fca5a5", fontSize: 13, marginTop: 6, paddingLeft: 16 }}>
+                        {q.redFlags.map((f, i) => <li key={i} style={{ marginBottom: 4 }}>{f}</li>)}
+                      </ul>
+                    </div>
+                  </div>
+                  <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderRadius: 10, padding: 12 }}>
+                    <Label text="💬 Follow-up question" color="#93c5fd" />
+                    <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 6, fontStyle: "italic" }}>{q.followUp}</p>
+                  </div>
+                  <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 10, padding: 12 }}>
+                    <Label text="👂 Listen for" color="#fbbf24" />
+                    <p style={{ color: "#fde68a", fontSize: 13, marginTop: 6 }}>{q.listen}</p>
+                  </div>
+                </div>
+              )}
+            </Card>
+          ))}
+        </div>
+      );
+    }
+
+    const TECHNIQUE_MAP = {
+      "not-interested":  { technique: "Pattern Interrupt",   color: "#f59e0b", tone: "Drop your pace. Let silence land. Curious, not pushy." },
+      "happy-provider":  { technique: "Feel / Felt / Found", color: "#60a5fa", tone: "Warm, empathetic. Match their energy before shifting it." },
+      "no-time":         { technique: "Micro-Commitment",    color: "#4ade80", tone: "Upbeat, concise. Ask for seconds, not minutes." },
+      "send-email":      { technique: "Gatekeeping Control", color: "#f97316", tone: "Friendly but assertive. Don't accept the email dodge." },
+      "decision-maker":  { technique: "Collaborative Frame", color: "#a78bfa", tone: "Curious. Make them feel included, not bypassed." },
+      "already-shopped": { technique: "Evidence Reframe",    color: "#34d399", tone: "Confident, numbers-led. Let data do the persuading." },
+      "contract-locked": { technique: "Long-Game Plant",     color: "#fb923c", tone: "Patient. Plant seeds. No pressure — just timing." },
+      "too-expensive":   { technique: "ROI Bridge",          color: "#22d3ee", tone: "Grounded. Anchor on cost of inaction, not price." },
+      "surcharge-ban":   { technique: "Authority Pivot",     color: "#e879f9", tone: "Informed, calm authority. You know more than they do." },
+    };
+
+    function ObjectionsView({ callState }) {
+      const [search, setSearch] = useState("");
+      const [expanded, setExpanded] = useState(null);
+      const [copiedQ, setCopiedQ] = useState(null);
+
+      const filtered = useMemo(() => {
+        let list = OBJECTIONS;
+        if (callState === "losing") list = list.filter(o => ["Mid Call", "Close"].includes(o.stage));
+        if (callState === "objecting") list = list.filter(o => o.stage === "Close" || o.id === "surcharge-ban");
+        if (search) list = list.filter(o => `${o.objection} ${o.stage} ${o.reality}`.toLowerCase().includes(search.toLowerCase()));
+        return list;
+      }, [search, callState]);
+
+      function copyQ(q) {
+        try { navigator.clipboard.writeText(q); } catch {}
+        setCopiedQ(q);
+        setTimeout(() => setCopiedQ(null), 1400);
+      }
+
+      return (
+        <div>
+          {/* Challenger Mindset Header */}
+          <div style={{ background: "linear-gradient(135deg,#0f172a 0%,#1e1b4b 100%)", border: "1px solid #4338ca", borderRadius: 14, padding: 16, marginBottom: 20 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <span style={{ fontSize: 18 }}>⚔️</span>
+              <span style={{ color: "#a5b4fc", fontSize: 14, fontWeight: 700, letterSpacing: 0.5 }}>CHALLENGER SALE — YOUR 3 MOVES</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginBottom: 12 }}>
+              {CHALLENGER_MINDSET.moves.map(m => (
+                <div key={m.label} style={{ background: "#0f1117", borderRadius: 10, padding: 10, textAlign: "center", border: `1px solid ${m.color}33` }}>
+                  <div style={{ fontSize: 18 }}>{m.icon}</div>
+                  <div style={{ color: m.color, fontSize: 12, fontWeight: 800, marginTop: 4 }}>{m.label}</div>
+                  <div style={{ color: "#94a3b8", fontSize: 11, marginTop: 4, lineHeight: 1.4 }}>{m.description}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ background: "#0f1117", borderRadius: 10, padding: 10 }}>
+              <div style={{ color: "#818cf8", fontSize: 11, fontWeight: 700, marginBottom: 6 }}>UNIVERSAL CHALLENGE QUESTIONS</div>
+              {CHALLENGER_MINDSET.universalQuestions.map((q, i) => (
+                <div key={i} onClick={() => copyQ(q)} style={{ color: "#c7d2fe", fontSize: 12, padding: "5px 0", borderBottom: i < CHALLENGER_MINDSET.universalQuestions.length - 1 ? "1px solid #1e293b" : "none", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <span style={{ lineHeight: 1.5 }}>"{q}"</span>
+                  <span style={{ color: copiedQ === q ? "#4ade80" : "#334155", fontSize: 10, flexShrink: 0, marginTop: 2 }}>{copiedQ === q ? "✓" : "⊕"}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <SearchBar value={search} onChange={setSearch} placeholder="Search objection, stage, situation..." />
+
+          {callState === "losing" && (
+            <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 10, padding: 12, marginBottom: 16 }}>
+              <p style={{ color: "#f87171", fontSize: 13, fontWeight: 600 }}>🚨 Losing the Call mode — mid-call and close-stage objections only</p>
+            </div>
+          )}
+          {callState === "objecting" && (
+            <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 10, padding: 12, marginBottom: 16 }}>
+              <p style={{ color: "#fbbf24", fontSize: 13, fontWeight: 600 }}>⚠️ Objecting mode — close-stage objections and surcharge ban rebuttal</p>
+            </div>
+          )}
+
+          {filtered.map(obj => {
+            const tech = TECHNIQUE_MAP[obj.id] || { technique: "Consult", color: "#94a3b8", tone: "Calm and curious." };
+            return (
+              <Card key={obj.id}>
+                <div onClick={() => setExpanded(expanded === obj.id ? null : obj.id)} style={{ cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 12 }}>
+                  <span style={{ fontSize: 24 }}>{obj.icon}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, flexWrap: "wrap" }}>
+                      <h3 style={{ fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>"{obj.objection}"</h3>
+                      <span style={{ color: "#64748b", fontSize: 18 }}>{expanded === obj.id ? "▲" : "▼"}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
+                      <span className={`tag ${obj.stageBadge}`}>{obj.stage}</span>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: tech.color, background: tech.color + "18", border: `1px solid ${tech.color}44`, borderRadius: 6, padding: "2px 7px" }}>{tech.technique}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {expanded === obj.id && (
+                  <div style={{ marginTop: 16, display: "grid", gap: 12 }}>
+
+                    {/* Tonality */}
+                    <div style={{ background: "#111827", border: `1px solid ${tech.color}44`, borderRadius: 10, padding: 12, display: "flex", alignItems: "flex-start", gap: 10 }}>
+                      <span style={{ fontSize: 20, lineHeight: 1 }}>🎙️</span>
+                      <div>
+                        <div style={{ color: tech.color, fontSize: 11, fontWeight: 800, marginBottom: 4 }}>TONALITY — {tech.technique.toUpperCase()}</div>
+                        <div style={{ color: "#cbd5e1", fontSize: 13 }}>{tech.tone}</div>
+                      </div>
+                    </div>
+
+                    {/* Reality */}
+                    <div style={{ background: "#150d2e", border: "1px solid #4c1d95", borderRadius: 10, padding: 12 }}>
+                      <Label text="🧠 What's really happening" color="#c084fc" />
+                      <p style={{ color: "#e9d5ff", fontSize: 13, marginTop: 6 }}>{obj.reality}</p>
+                    </div>
+
+                    {/* Rebuttal */}
+                    <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14 }}>
+                      <Label text="💬 Rebuttal (say this)" color="#93c5fd" />
+                      <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 8, fontStyle: "italic", lineHeight: 1.7 }}>"{obj.rebuttal}"</p>
+                    </div>
+
+                    {/* Do not say */}
+                    <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 10, padding: 12 }}>
+                      <Label text="🚫 Do NOT say" color="#f87171" />
+                      <ul style={{ color: "#fca5a5", fontSize: 13, marginTop: 6, paddingLeft: 16 }}>
+                        {obj.doNotSay.map((d, i) => <li key={i} style={{ marginBottom: 4 }}>{d}</li>)}
+                      </ul>
+                    </div>
+
+                    {/* Challenger Reframe */}
+                    {obj.challengerReframe && (
+                      <div style={{ background: "linear-gradient(135deg,#0f172a,#1e1b4b)", border: "1px solid #4338ca", borderRadius: 10, padding: 14 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                          <span style={{ fontSize: 16 }}>⚔️</span>
+                          <Label text="CHALLENGER REFRAME — TEACH FIRST" color="#818cf8" />
+                        </div>
+                        <p style={{ color: "#c7d2fe", fontSize: 13, lineHeight: 1.7, fontStyle: "italic" }}>"{obj.challengerReframe}"</p>
+                      </div>
+                    )}
+
+                    {/* Challenge Questions */}
+                    {obj.challengeQuestions && obj.challengeQuestions.length > 0 && (
+                      <div style={{ background: "#0a1628", border: "1px solid #1d4ed8", borderRadius: 10, padding: 14 }}>
+                        <div style={{ color: "#60a5fa", fontSize: 11, fontWeight: 800, marginBottom: 10 }}>⚡ CHALLENGE QUESTIONS — tap to copy</div>
+                        <div style={{ display: "grid", gap: 6 }}>
+                          {obj.challengeQuestions.map((q, i) => (
+                            <div key={i} onClick={() => copyQ(q)} style={{ background: copiedQ === q ? "#052e16" : "#0f1d3d", border: `1px solid ${copiedQ === q ? "#14532d" : "#1e3a5f"}`, borderRadius: 8, padding: "9px 12px", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, transition: "background .2s" }}>
+                              <span style={{ color: copiedQ === q ? "#4ade80" : "#93c5fd", fontSize: 13, fontStyle: "italic", lineHeight: 1.5 }}>"{q}"</span>
+                              <span style={{ color: copiedQ === q ? "#4ade80" : "#334155", fontSize: 14, flexShrink: 0 }}>{copiedQ === q ? "✓" : "⊕"}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Re-engager */}
+                    <div style={{ background: "#052e16", border: "1px solid #14532d", borderRadius: 10, padding: 12 }}>
+                      <Label text="🔄 Re-engaging question" color="#4ade80" />
+                      <p style={{ color: "#bbf7d0", fontSize: 13, marginTop: 6, fontStyle: "italic" }}>{obj.reengager}</p>
+                    </div>
+
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function LostLeadsView() {
+      const [section, setSection] = useState("scripts");
+      const sections = [
+        { id: "scripts", label: "Re-Engagement Scripts" },
+        { id: "whyfell", label: "Why They Fell Off" },
+        { id: "aida", label: "AIDA Framework" },
+        { id: "consistency", label: "On-Brand Rules" },
+      ];
+      return (
+        <div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
+            {sections.map(s => (
+              <button key={s.id} onClick={() => setSection(s.id)} style={{
+                padding: "8px 14px", border: "none", borderRadius: 8, cursor: "pointer",
+                fontSize: 13, fontWeight: 600,
+                background: section === s.id ? "#2563eb" : "#1a1d27",
+                color: section === s.id ? "#fff" : "#64748b",
+                border: `1px solid ${section === s.id ? "#2563eb" : "#2d3748"}`,
+              }}>{s.label}</button>
+            ))}
+          </div>
+
+          {section === "scripts" && (
+            <div>
+              <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16 }}>The old inbound is gold. These prospects already showed intent — they just got lost. Use the RBA ban as a new legitimate reason to call.</p>
+              {LOST_LEADS_DATA.scripts.map((s, i) => (
+                <Card key={i}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                    <span className={`tag ${s.badgeColor}`}>{s.label}</span>
+                    <span style={{ color: "#64748b", fontSize: 12 }}>Lead age: {s.age}</span>
+                  </div>
+                  <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14, marginBottom: 10 }}>
+                    <Label text="💬 Opening script" color="#93c5fd" />
+                    <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 8, fontStyle: "italic", lineHeight: 1.7 }}>{s.script}</p>
+                  </div>
+                  <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 10, padding: 12 }}>
+                    <Label text="Rep notes" color="#fbbf24" />
+                    <p style={{ color: "#fde68a", fontSize: 13, marginTop: 6 }}>{s.notes}</p>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+
+          {section === "whyfell" && (
+            <div>
+              <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16 }}>Understanding why a lead went cold helps you open the re-engagement call at the right angle.</p>
+              {LOST_LEADS_DATA.whyTheyFell.map((w, i) => (
+                <Card key={i}>
+                  <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                    <span style={{ fontSize: 24 }}>{w.icon}</span>
+                    <div>
+                      <h3 style={{ fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>{w.reason}</h3>
+                      <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 6, lineHeight: 1.6 }}>{w.detail}</p>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+
+          {section === "aida" && (
+            <div>
+              <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16 }}>The complete Attention → Interest → Desire → Action call flow. Each phase uses the BNA answers you collected.</p>
+              {LOST_LEADS_DATA.aida.map((phase, i) => (
+                <Card key={i} style={{ borderLeft: `4px solid ${phase.color}` }}>
+                  <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+                    <div style={{ width: 36, height: 36, background: phase.color, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 800, color: "#fff" }}>{phase.phase}</div>
+                    <div>
+                      <p style={{ color: phase.color, fontWeight: 700, fontSize: 14 }}>{phase.label}</p>
+                      <p style={{ color: "#94a3b8", fontSize: 12 }}>{phase.goal}</p>
+                    </div>
+                  </div>
+                  <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14, marginBottom: 10 }}>
+                    <Label text="💬 Script" color="#93c5fd" />
+                    <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 8, fontStyle: "italic", lineHeight: 1.7 }}>{phase.script}</p>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <Label text="Why this works" color="#4ade80" />
+                      <p style={{ color: "#bbf7d0", fontSize: 12, marginTop: 6 }}>{phase.why}</p>
+                    </div>
+                    <div>
+                      <Label text="🚫 Don't" color="#f87171" />
+                      <p style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>{phase.doNot}</p>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+
+          {section === "consistency" && (
+            <div>
+              <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16 }}>These rules protect the brand and protect you. Know them cold.</p>
+              {LOST_LEADS_DATA.consistency.map((c, i) => (
+                <Card key={i}>
+                  <p style={{ color: "#f1f5f9", fontSize: 15, fontWeight: 700, marginBottom: 8 }}>✅ {c.rule}</p>
+                  <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 8, padding: 10 }}>
+                    <Label text="Why" color="#60a5fa" />
+                    <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 6 }}>{c.reason}</p>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function SurchargeIntelView() {
+      return (
+        <div>
+          {/* Urgency Banner */}
+          <div style={{ background: "linear-gradient(135deg, #7f1d1d 0%, #1f0a0a 100%)", border: "1px solid #991b1b", borderRadius: 12, padding: 16, marginBottom: 20 }}>
+            <p style={{ color: "#fca5a5", fontSize: 15, fontWeight: 700 }}>{SURCHARGE_INTEL.urgencyBanner}</p>
+            <p style={{ color: "#94a3b8", fontSize: 13, marginTop: 6 }}>{SURCHARGE_INTEL.summary}</p>
+          </div>
+
+          {/* Timeline */}
+          <h3 style={{ color: "#f1f5f9", fontSize: 15, fontWeight: 700, marginBottom: 12 }}>📅 Key Dates</h3>
+          {SURCHARGE_INTEL.timeline.map((t, i) => (
+            <div key={i} style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+              <div style={{ width: 3, background: i === 0 ? "#4ade80" : i === 1 ? "#f87171" : "#fbbf24", borderRadius: 2, flexShrink: 0 }} />
+              <div style={{ background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 10, padding: 14, flex: 1 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                  <span className={`tag ${t.badge}`}>{t.date}</span>
+                </div>
+                <p style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 600 }}>{t.event}</p>
+                <p style={{ color: "#64748b", fontSize: 12, marginTop: 6 }}>{t.action}</p>
+              </div>
+            </div>
+          ))}
+
+          {/* What changes / doesn't */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, margin: "20px 0" }}>
+            <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 10, padding: 14 }}>
+              <Label text="🔴 What Changes (Oct 1)" color="#f87171" />
+              <ul style={{ color: "#fca5a5", fontSize: 13, marginTop: 8, paddingLeft: 16 }}>
+                {SURCHARGE_INTEL.whatChanges.map((w, i) => <li key={i} style={{ marginBottom: 6 }}>{w}</li>)}
+              </ul>
+            </div>
+            <div style={{ background: "#052e16", border: "1px solid #14532d", borderRadius: 10, padding: 14 }}>
+              <Label text="✅ What Stays (Shift4 advantage)" color="#4ade80" />
+              <ul style={{ color: "#bbf7d0", fontSize: 13, marginTop: 8, paddingLeft: 16 }}>
+                {SURCHARGE_INTEL.whatDoesntChange.map((w, i) => <li key={i} style={{ marginBottom: 6 }}>{w}</li>)}
+              </ul>
+            </div>
+          </div>
+
+          {/* Objection rebuttal */}
+          <Card style={{ borderColor: "#1e3a5f", background: "#0c1a2e", marginBottom: 20 }}>
+            <Label text="💬 When they say 'surcharging is going away — what's the point?'" color="#93c5fd" />
+            <p style={{ color: "#dbeafe", fontSize: 13, marginTop: 10, fontStyle: "italic", lineHeight: 1.7 }}>{SURCHARGE_INTEL.handleObjection}</p>
+          </Card>
+
+          {/* Post-ban pitch */}
+          <h3 style={{ color: "#f1f5f9", fontSize: 15, fontWeight: 700, marginBottom: 12 }}>🏆 Value Props After October 2026</h3>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12, marginBottom: 20 }}>
+            {SURCHARGE_INTEL.postBanPitch.map((p, i) => (
+              <div key={i} style={{ background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 10, padding: 14 }}>
+                <p style={{ fontSize: 20, marginBottom: 8 }}>{p.icon}</p>
+                <p style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 14 }}>{p.prop}</p>
+                <p style={{ color: "#94a3b8", fontSize: 12, marginTop: 6, lineHeight: 1.6 }}>{p.detail}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Products */}
+          <h3 style={{ color: "#f1f5f9", fontSize: 15, fontWeight: 700, marginBottom: 12 }}>💳 Shift4 AU Products</h3>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            {SURCHARGE_INTEL.products.map((p, i) => (
+              <div key={i} style={{ background: "#1a1d27", border: `1px solid ${i === 0 ? "#14532d" : "#1e3a5f"}`, borderRadius: 10, padding: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <p style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 14 }}>{p.name}</p>
+                  <span className={`tag ${i === 0 ? "badge-yellow" : "badge-green"}`}>{i === 0 ? "⏳ Until Oct 2026" : "✅ Permanent"}</span>
+                </div>
+                <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 8 }}>{p.description}</p>
+                <div style={{ background: "#0c1a2e", borderRadius: 8, padding: 10 }}>
+                  <Label text="When to pitch" color="#60a5fa" />
+                  <p style={{ color: "#93c5fd", fontSize: 12, marginTop: 4 }}>{p.pitch}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ───────────────────────── COACHING COMPONENTS ─────────────────── */
+
+    function StarRating({ label, value, onChange }) {
+      return (
+        <div style={{ marginBottom: 14 }}>
+          <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 6 }}>{label}</p>
+          <div style={{ display: "flex", gap: 8 }}>
+            {[1,2,3,4,5].map(n => (
+              <button key={n} onClick={() => onChange(n)} style={{
+                width: 36, height: 36, borderRadius: 8, border: "none", cursor: "pointer", fontSize: 18,
+                background: value >= n ? "#2563eb" : "#2d3748",
+                color: value >= n ? "#fff" : "#64748b", transition: "all .1s",
+              }}>{value >= n ? "★" : "☆"}</button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function FeedbackModal({ onSave, onClose, initialValues = {} }) {
+      const [outcome, setOutcome]             = useState(initialValues.outcome || null);
+      const [stageReached, setStageReached]   = useState(initialValues.stageReached || null);
+      const [objectionId, setObjectionId]     = useState(initialValues.objectionId || "");
+      const [industryId, setIndustryId]       = useState(initialValues.industryId || "");
+      const [callType, setCallType]           = useState(initialValues.callType || "outbound");
+      const [isFirstCall, setIsFirstCall]     = useState(initialValues.isFirstCall !== false);
+      const [openerScore, setOpenerScore]     = useState(initialValues.openerScore || 3);
+      const [confidenceScore, setConfidenceScore] = useState(initialValues.confidenceScore || 3);
+      const [rapportScore, setRapportScore]   = useState(initialValues.rapportScore || 3);
+      const [notes, setNotes]                 = useState(initialValues.notes || "");
+
+      const outcomes = [
+        { id: "won",          label: "Won",         icon: "🏆", color: "#16a34a", bg: "#052e16", border: "#14532d" },
+        { id: "progressing",  label: "Progressed",  icon: "📅", color: "#2563eb", bg: "#0c1a2e", border: "#1e3a5f" },
+        { id: "lost",         label: "Lost",        icon: "❌", color: "#dc2626", bg: "#1f0a0a", border: "#7f1d1d" },
+        { id: "noanswer",     label: "No Answer",   icon: "📵", color: "#64748b", bg: "#1a1d27", border: "#2d3748" },
+        { id: "voicemail",    label: "Voicemail",   icon: "📬", color: "#7c3aed", bg: "#150d2e", border: "#4c1d95" },
+        { id: "wrongnumber",  label: "Wrong #",     icon: "🚫", color: "#475569", bg: "#0f1117", border: "#334155" },
+      ];
+
+      const stages = ["opener", "bna", "pitch", "objection", "close", "won"];
+      const stageLabels = { opener: "Opener", bna: "BNA", pitch: "Pitch", objection: "Objection", close: "Close attempt", won: "Won" };
+
+      const canSave = outcome && stageReached;
+
+      function handleSave() {
+        const call = {
+          id: Date.now(), time: new Date().toISOString(),
+          outcome, stageReached, objectionId: objectionId || null,
+          industryId: industryId || null, callType, isFirstCall,
+          openerScore, confidenceScore, rapportScore,
+          notes: notes.trim(),
+        };
+        call.weight = calcWeight(call);
+        onSave(call);
+      }
+
+      return (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+          <div style={{ background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 18, padding: 24, width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <h2 style={{ color: "#f1f5f9", fontSize: 18, fontWeight: 800 }}>📞 Log That Call</h2>
+              <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+
+            {/* Outcome */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 10 }}>What happened?</p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 18 }}>
+              {outcomes.map(o => (
+                <button key={o.id} onClick={() => setOutcome(o.id)} style={{
+                  padding: "10px 6px", borderRadius: 10, cursor: "pointer",
+                  border: `1px solid ${outcome === o.id ? o.color : "#2d3748"}`,
+                  background: outcome === o.id ? o.bg : "#0f1117",
+                  color: outcome === o.id ? o.color : "#64748b",
+                  fontSize: 12, fontWeight: 700, transition: "all .1s",
+                }}>
+                  <div style={{ fontSize: 20, marginBottom: 4 }}>{o.icon}</div>
+                  {o.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Call type */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+              {["inbound", "outbound"].map(t => (
+                <button key={t} onClick={() => setCallType(t)} style={{
+                  flex: 1, padding: "7px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 700,
+                  border: `1px solid ${callType === t ? (t === "inbound" ? "#4ade80" : "#60a5fa") : "#2d3748"}`,
+                  background: callType === t ? (t === "inbound" ? "#052e16" : "#0c1a2e") : "transparent",
+                  color: callType === t ? (t === "inbound" ? "#4ade80" : "#60a5fa") : "#64748b",
+                }}>{t === "inbound" ? "📥 Inbound" : "📤 Outbound"}</button>
+              ))}
+            </div>
+
+            {/* Stage reached */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>Furthest stage reached</p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 18 }}>
+              {stages.map(s => (
+                <button key={s} onClick={() => setStageReached(s)} style={{
+                  padding: "6px 12px", borderRadius: 99, cursor: "pointer", fontSize: 12, fontWeight: 600,
+                  border: `1px solid ${stageReached === s ? "#60a5fa" : "#2d3748"}`,
+                  background: stageReached === s ? "#0c1a2e" : "transparent",
+                  color: stageReached === s ? "#60a5fa" : "#64748b",
+                }}>{stageLabels[s]}</button>
+              ))}
+            </div>
+
+            {/* Industry */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>Industry (optional)</p>
+            <select value={industryId} onChange={e => setIndustryId(e.target.value)} style={{
+              width: "100%", padding: "10px 12px", background: "#0f1117", border: "1px solid #2d3748",
+              borderRadius: 8, color: "#e2e8f0", fontSize: 13, marginBottom: 18, outline: "none",
+            }}>
+              <option value="">— Not recorded —</option>
+              {INDUSTRIES.map(i => <option key={i.id} value={i.id}>{i.icon} {i.name.split("(")[0].trim()}</option>)}
+            </select>
+
+            {/* Objection hit */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>Main objection? (optional)</p>
+            <select value={objectionId} onChange={e => setObjectionId(e.target.value)} style={{
+              width: "100%", padding: "10px 12px", background: "#0f1117", border: "1px solid #2d3748",
+              borderRadius: 8, color: "#e2e8f0", fontSize: 13, marginBottom: 18, outline: "none",
+            }}>
+              <option value="">None / didn't come up</option>
+              {OBJECTIONS.map(o => <option key={o.id} value={o.id}>{o.objection.substring(0, 55)}</option>)}
+            </select>
+
+            {/* Skill scores */}
+            <StarRating label="How strong was your opener?" value={openerScore} onChange={setOpenerScore} />
+            <StarRating label="How confident did you feel?" value={confidenceScore} onChange={setConfidenceScore} />
+            <StarRating label="Did rapport build?" value={rapportScore} onChange={setRapportScore} />
+
+            {/* Notes */}
+            <textarea value={notes} onChange={e => setNotes(e.target.value)} placeholder="Quick note (optional)..."
+              style={{ width: "100%", padding: "10px 12px", background: "#0f1117", border: "1px solid #2d3748", borderRadius: 8, color: "#e2e8f0", fontSize: 13, resize: "vertical", minHeight: 64, outline: "none", marginBottom: 20 }}
+            />
+
+            {/* First call toggle */}
+            <div onClick={() => setIsFirstCall(v => !v)} style={{
+              display: "flex", gap: 10, alignItems: "center", padding: "11px 14px", marginBottom: 16,
+              background: isFirstCall ? "#052e16" : "#0f1117", border: `1px solid ${isFirstCall ? "#14532d" : "#2d3748"}`,
+              borderRadius: 10, cursor: "pointer",
+            }}>
+              <span style={{ fontSize: 18 }}>{isFirstCall ? "✅" : "⬜"}</span>
+              <div>
+                <p style={{ color: isFirstCall ? "#4ade80" : "#94a3b8", fontSize: 13, fontWeight: 600 }}>First ever contact with this prospect?</p>
+                <p style={{ color: "#475569", fontSize: 11 }}>Tick if this was cold/first touch — not a follow-up or callback</p>
+              </div>
+            </div>
+
+            <button onClick={handleSave} disabled={!canSave} style={{
+              width: "100%", padding: "14px", background: canSave ? "#2563eb" : "#1e3a5f", border: "none", borderRadius: 10,
+              color: canSave ? "#fff" : "#64748b", fontSize: 15, fontWeight: 700, cursor: canSave ? "pointer" : "default",
+            }}>Save Call {canSave ? "→" : "(select outcome + stage)"}</button>
+          </div>
+        </div>
+      );
+    }
+
+    function InterventionModal({ streak, log, onDismiss, onSetTab }) {
+      const today = getTodayCalls(log);
+      const totalCalls = today.length;
+      const won = today.filter(c => c.outcome === "won").length;
+      const progressed = today.filter(c => c.outcome === "progressing").length;
+      const gaps = getGaps(log);
+
+      const breakIdx = (streak - 1) % BREAK_SUGGESTIONS.length;
+      const breakSuggestion = BREAK_SUGGESTIONS[breakIdx];
+      const streakMsg = STREAK_MESSAGES.find(m => m.streak >= streak) || STREAK_MESSAGES[STREAK_MESSAGES.length - 1];
+
+      const weakSkillDrill = gaps ? SKILL_DRILLS[gaps.weakSkill?.[0]] : null;
+      const weakStageTip  = gaps ? STAGE_GUIDANCE[gaps.weakStage?.[0]] : null;
+
+      return (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.9)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div style={{ background: "#1a1d27", border: "1px solid #334155", borderRadius: 20, padding: 32, width: "100%", maxWidth: 520, textAlign: "center" }}>
+
+            {/* Icon */}
+            <div style={{ fontSize: 52, marginBottom: 16 }}>🛑</div>
+
+            {/* Main message */}
+            <h2 style={{ color: "#f1f5f9", fontSize: 20, fontWeight: 800, marginBottom: 10 }}>
+              Pause for a second.
+            </h2>
+            <p style={{ color: "#94a3b8", fontSize: 15, lineHeight: 1.7, marginBottom: 8 }}>
+              {streak} tough {streak === 1 ? "call" : "calls"} in a row. That happens to every good rep — the ones who manage it well are the ones who notice it and reset deliberately.
+            </p>
+            <p style={{ color: streakMsg.colour, fontSize: 14, fontWeight: 600, marginBottom: 20 }}>
+              {streakMsg.message}
+            </p>
+
+            {/* Today stats */}
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", marginBottom: 24 }}>
+              <div style={{ background: "#052e16", border: "1px solid #14532d", borderRadius: 10, padding: "10px 18px" }}>
+                <p style={{ color: "#4ade80", fontSize: 22, fontWeight: 800 }}>{won}</p>
+                <p style={{ color: "#64748b", fontSize: 11 }}>Won today</p>
+              </div>
+              <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 10, padding: "10px 18px" }}>
+                <p style={{ color: "#60a5fa", fontSize: 22, fontWeight: 800 }}>{progressed}</p>
+                <p style={{ color: "#64748b", fontSize: 11 }}>Progressed</p>
+              </div>
+              <div style={{ background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 10, padding: "10px 18px" }}>
+                <p style={{ color: "#e2e8f0", fontSize: 22, fontWeight: 800 }}>{totalCalls}</p>
+                <p style={{ color: "#64748b", fontSize: 11 }}>Total calls</p>
+              </div>
+            </div>
+
+            {/* Break suggestion */}
+            <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 14, padding: 18, marginBottom: 18, textAlign: "left" }}>
+              <p style={{ color: "#60a5fa", fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Suggested reset: {breakSuggestion.icon} {breakSuggestion.action}</p>
+              <p style={{ color: "#94a3b8", fontSize: 13 }}>{breakSuggestion.detail}</p>
+            </div>
+
+            {/* Specific coaching tip */}
+            {(weakStageTip || weakSkillDrill) && (
+              <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 14, padding: 16, marginBottom: 20, textAlign: "left" }}>
+                <p style={{ color: "#fbbf24", fontSize: 12, fontWeight: 700, marginBottom: 6 }}>📚 When you come back, start here:</p>
+                <p style={{ color: "#fde68a", fontSize: 13 }}>
+                  {weakStageTip?.tip || weakSkillDrill?.drill}
+                </p>
+                {(weakStageTip || weakSkillDrill) && (
+                  <button onClick={() => { onSetTab((weakStageTip || weakSkillDrill).tab); onDismiss(); }} style={{
+                    marginTop: 10, background: "#713f12", border: "none", borderRadius: 8, padding: "6px 14px",
+                    color: "#fbbf24", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                  }}>Go there now →</button>
+                )}
+              </div>
+            )}
+
+            {/* Buttons */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button onClick={onDismiss} style={{
+                padding: "13px", background: "#052e16", border: "1px solid #14532d", borderRadius: 10,
+                color: "#4ade80", fontSize: 14, fontWeight: 700, cursor: "pointer",
+              }}>
+                🚶 I'll take that break
+              </button>
+              <button onClick={onDismiss} style={{
+                padding: "13px", background: "#1e3a5f", border: "1px solid #2563eb", borderRadius: 10,
+                color: "#60a5fa", fontSize: 14, fontWeight: 700, cursor: "pointer",
+              }}>
+                ⚡ I'm ready — let's go
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function CoachingView({ log, onSetTab, isLoading }) {
+      const today = getTodayCalls(log);
+      const dailyScore = getDailyScore(log);
+      const streak = getBadStreak(log);
+      const hourly = getHourlyBreakdown(log);
+      const gaps = getGaps(log);
+      const week = getWeekHistory(log);
+      const fcr = getFirstCallRate(log);
+      const industryBreakdown = getIndustryBreakdown(log);
+      const [dailyTarget, setDailyTarget] = useLocalStorage("shift4_daily_target", 50);
+      const [editingTarget, setEditingTarget] = useState(false);
+      const [targetInput, setTargetInput] = useState(String(dailyTarget));
+
+      const won = today.filter(c => c.outcome === "won").length;
+      const progressed = today.filter(c => c.outcome === "progressing").length;
+      const goodCalls = won + progressed;
+      const winRate = today.length ? Math.round((goodCalls / today.length) * 100) : 0;
+
+      // Projected EOD calls based on current hour pace (9am–5pm = 8 hour day)
+      const nowHour = new Date().getHours();
+      const workStart = 9;
+      const workEnd = 17;
+      const hoursElapsed = Math.max(1, nowHour - workStart);
+      const hoursRemaining = Math.max(0, workEnd - nowHour);
+      const projectedCalls = today.length ? Math.round((today.length / hoursElapsed) * (hoursElapsed + hoursRemaining)) : 0;
+      const fcrPct = fcr?.rate ?? null;
+      const fcrColor = fcrPct === null ? "#64748b" : fcrPct >= 60 ? "#4ade80" : fcrPct >= 40 ? "#fbbf24" : "#f87171";
+
+      const OUTCOME_LABELS = { won: "Won", progressing: "Progressed", lost: "Lost", noanswer: "No Answer", voicemail: "Voicemail", wrongnumber: "Wrong #" };
+      const OUTCOME_COLOURS = { won: "#4ade80", progressing: "#60a5fa", lost: "#f87171", noanswer: "#64748b", voicemail: "#c084fc", wrongnumber: "#475569" };
+
+      const scoreColour = dailyScore >= 7 ? "#4ade80" : dailyScore >= 4 ? "#fbbf24" : "#f87171";
+      const activeHours = Object.keys(hourly).map(Number).sort((a, b) => a - b);
+
+      // Run Rate card (shown always, even when no calls yet)
+      const RunRateCard = (
+        <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 14, padding: 20, marginBottom: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px" }}>Run Rate</p>
+            {editingTarget ? (
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="number" value={targetInput} onChange={e => setTargetInput(e.target.value)}
+                  style={{ width: 60, padding: "4px 8px", background: "#0f1117", border: "1px solid #2d3748", borderRadius: 6, color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+                <button onClick={() => { const n = parseInt(targetInput); if (n > 0) setDailyTarget(n); setEditingTarget(false); }}
+                  style={{ background: "#2563eb", border: "none", borderRadius: 6, padding: "4px 10px", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Set</button>
+              </div>
+            ) : (
+              <button onClick={() => setEditingTarget(true)} style={{ background: "none", border: "1px solid #2d3748", borderRadius: 6, padding: "3px 10px", color: "#64748b", fontSize: 11, cursor: "pointer" }}>
+                Target: {dailyTarget} calls ✏️
+              </button>
+            )}
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(110px, 1fr))", gap: 10, marginBottom: 14 }}>
+            {[
+              { label: "Calls today", value: `${today.length} / ${dailyTarget}`, color: today.length >= dailyTarget ? "#4ade80" : "#e2e8f0" },
+              { label: "Projected EOD", value: projectedCalls || "—", color: projectedCalls >= dailyTarget ? "#4ade80" : "#fbbf24" },
+              { label: "FCR (first-call)", value: fcrPct !== null ? `${fcrPct}%` : "—", color: fcrColor },
+              { label: "Target FCR", value: "60%", color: "#64748b" },
+            ].map((s, i) => (
+              <div key={i} style={{ background: "#0f1117", borderRadius: 10, padding: "10px 12px" }}>
+                <p style={{ color: s.color, fontSize: 20, fontWeight: 800 }}>{s.value}</p>
+                <p style={{ color: "#64748b", fontSize: 11 }}>{s.label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Calls progress bar */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={{ color: "#64748b", fontSize: 11 }}>Call volume</span>
+              <span style={{ color: "#94a3b8", fontSize: 11 }}>{Math.round((today.length / dailyTarget) * 100)}%</span>
+            </div>
+            <div style={{ background: "#0f1117", borderRadius: 99, height: 6, overflow: "hidden" }}>
+              <div style={{ width: `${Math.min(100, (today.length / dailyTarget) * 100)}%`, height: "100%", background: "#2563eb", borderRadius: 99, transition: "width .5s" }} />
+            </div>
+          </div>
+
+          {/* FCR bar vs 60% target */}
+          {fcr && (
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <span style={{ color: "#64748b", fontSize: 11 }}>First-call close rate</span>
+                <span style={{ color: fcrColor, fontSize: 11, fontWeight: 700 }}>{fcrPct}% ({fcr.wins}/{fcr.total} first calls)</span>
+              </div>
+              <div style={{ position: "relative", paddingTop: 14 }}>
+                <div style={{ position: "absolute", left: "60%", top: 0, transform: "translateX(-50%)", color: "#60a5fa", fontSize: 9, fontWeight: 800, whiteSpace: "nowrap" }}>60% target ▼</div>
+                <div style={{ background: "#0f1117", borderRadius: 99, height: 8, overflow: "hidden", position: "relative" }}>
+                  <div style={{ width: `${Math.min(100, fcrPct)}%`, height: "100%", background: fcrColor, borderRadius: 99, transition: "width .5s" }} />
+                </div>
+                <div style={{ position: "absolute", left: "60%", top: 14, bottom: 0, width: 3, background: "#3b82f6", transform: "translateX(-50%)", zIndex: 2, pointerEvents: "none" }} />
+              </div>
+            </div>
+          )}
+
+          {!fcr && today.length > 0 && (
+            <p style={{ color: "#475569", fontSize: 12, marginTop: 8 }}>When logging calls, tick "First ever contact?" to start tracking your first-call close rate.</p>
+          )}
+          {today.length === 0 && (
+            <p style={{ color: "#475569", fontSize: 12, marginTop: 8 }}>Log your first call to start tracking. Target: {dailyTarget} calls, 60% first-call close rate.</p>
+          )}
+        </div>
+      );
+
+      if (isLoading) {
+        return (
+          <div style={{ textAlign: "center", padding: "60px 24px" }}>
+            <div style={{ fontSize: 36, marginBottom: 12, animation: "spin 1s linear infinite" }}>⏳</div>
+            <p style={{ color: "#64748b", fontSize: 14 }}>Loading your call history…</p>
+          </div>
+        );
+      }
+
+      if (today.length === 0) {
+        return (
+          <div>
+            {RunRateCard}
+            <div style={{ textAlign: "center", padding: "40px 24px" }}>
+              <div style={{ fontSize: 52, marginBottom: 16 }}>📞</div>
+              <h3 style={{ color: "#f1f5f9", fontSize: 18, fontWeight: 700, marginBottom: 8 }}>No calls logged yet today</h3>
+              <p style={{ color: "#64748b", fontSize: 14 }}>Tap <strong style={{ color: "#f1f5f9" }}>🎯 Pre-Call</strong> to prep before each dial, then <strong style={{ color: "#f1f5f9" }}>📞 Log Call</strong> after each call ends. Your dashboard builds automatically.</p>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div>
+          {RunRateCard}
+          {/* Today's momentum */}
+          <div style={{ background: "linear-gradient(135deg, #0f1d3d 0%, #1a1d27 100%)", border: "1px solid #1e3a5f", borderRadius: 14, padding: 20, marginBottom: 20 }}>
+            <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 12 }}>Today's Momentum</p>
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
+              <div>
+                <p style={{ color: scoreColour, fontSize: 40, fontWeight: 800, lineHeight: 1 }}>{dailyScore}</p>
+                <p style={{ color: "#64748b", fontSize: 12 }}>avg score / 10</p>
+              </div>
+              <div style={{ flex: 1, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))", gap: 10 }}>
+                {[
+                  { label: "Calls made", value: today.length, color: "#e2e8f0" },
+                  { label: "Won", value: won, color: "#4ade80" },
+                  { label: "Progressed", value: progressed, color: "#60a5fa" },
+                  { label: "Win rate", value: `${winRate}%`, color: winRate >= 50 ? "#4ade80" : winRate >= 25 ? "#fbbf24" : "#f87171" },
+                ].map((s, i) => (
+                  <div key={i} style={{ background: "#0f1117", borderRadius: 10, padding: "10px 12px" }}>
+                    <p style={{ color: s.color, fontSize: 20, fontWeight: 800 }}>{s.value}</p>
+                    <p style={{ color: "#64748b", fontSize: 11 }}>{s.label}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* Score bar */}
+            <div style={{ marginTop: 14, background: "#0f1117", borderRadius: 99, height: 8, overflow: "hidden" }}>
+              <div style={{ width: `${(dailyScore / 10) * 100}%`, height: "100%", background: scoreColour, borderRadius: 99, transition: "width .5s" }} />
+            </div>
+            {streak > 0 && (
+              <p style={{ color: streak >= 3 ? "#f87171" : "#fbbf24", fontSize: 13, marginTop: 10, fontWeight: 600 }}>
+                {streak >= 3 ? `🚨 ${streak} tough calls in a row — check the intervention prompt` : `⚠️ ${streak} tough calls in a row — check the Objections tab before the next one`}
+              </p>
+            )}
+          </div>
+
+          {/* Hour by hour */}
+          {activeHours.length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 12 }}>Hour by Hour</p>
+              {activeHours.map(h => {
+                const block = hourly[h];
+                const label = `${h % 12 || 12}${h < 12 ? "am" : "pm"}`;
+                const rate = block.calls.length ? block.good / block.calls.length : 0;
+                const barColour = rate >= 0.5 ? "#4ade80" : rate >= 0.25 ? "#fbbf24" : "#f87171";
+                return (
+                  <div key={h} style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8 }}>
+                    <span style={{ color: "#64748b", fontSize: 12, width: 36, textAlign: "right", flexShrink: 0 }}>{label}</span>
+                    <div style={{ flex: 1, background: "#1a1d27", borderRadius: 8, height: 28, overflow: "hidden", position: "relative" }}>
+                      <div style={{ width: `${(block.score / 10) * 100}%`, height: "100%", background: barColour, opacity: .3 }} />
+                      <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", paddingLeft: 10, gap: 6 }}>
+                        {block.calls.map((c, i) => (
+                          <span key={i} style={{ width: 10, height: 10, borderRadius: "50%", background: OUTCOME_COLOURS[c.outcome], display: "inline-block", flexShrink: 0 }} title={OUTCOME_LABELS[c.outcome]} />
+                        ))}
+                      </div>
+                    </div>
+                    <span style={{ color: barColour, fontSize: 12, width: 28, textAlign: "right", fontWeight: 600 }}>{block.score}</span>
+                    <span style={{ color: "#64748b", fontSize: 11, width: 40 }}>{block.calls.length} calls</span>
+                  </div>
+                );
+              })}
+              <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
+                {Object.entries(OUTCOME_COLOURS).map(([k, v]) => (
+                  <div key={k} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: v }} />
+                    <span style={{ color: "#64748b", fontSize: 10 }}>{OUTCOME_LABELS[k]}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Gap analysis */}
+          {gaps && (
+            <div style={{ marginBottom: 20 }}>
+              <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 12 }}>Where the Gaps Are</p>
+              <div style={{ display: "grid", gap: 10 }}>
+                {gaps.weakStage && STAGE_GUIDANCE[gaps.weakStage[0]] && (
+                  <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 12, padding: 14 }}>
+                    <p style={{ color: "#f87171", fontSize: 12, fontWeight: 700, marginBottom: 4 }}>🛑 Calls are dying at: {STAGE_GUIDANCE[gaps.weakStage[0]].label}</p>
+                    <p style={{ color: "#fca5a5", fontSize: 13, marginBottom: 10 }}>{STAGE_GUIDANCE[gaps.weakStage[0]].tip}</p>
+                    <button onClick={() => onSetTab(STAGE_GUIDANCE[gaps.weakStage[0]].tab)} style={{
+                      background: "#7f1d1d", border: "none", borderRadius: 8, padding: "6px 14px", color: "#f87171", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    }}>Go to {STAGE_GUIDANCE[gaps.weakStage[0]].tab === "objections" ? "Objections" : STAGE_GUIDANCE[gaps.weakStage[0]].tab === "bna" ? "BNA" : "Lost Leads"} →</button>
+                  </div>
+                )}
+                {gaps.topObj && OBJECTIONS.find(o => o.id === gaps.topObj[0]) && (
+                  <div style={{ background: "#2d1b00", border: "1px solid #713f12", borderRadius: 12, padding: 14 }}>
+                    <p style={{ color: "#fbbf24", fontSize: 12, fontWeight: 700, marginBottom: 4 }}>⚠️ Top objection today: "{OBJECTIONS.find(o => o.id === gaps.topObj[0])?.objection}"</p>
+                    <p style={{ color: "#fde68a", fontSize: 13, marginBottom: 10 }}>Hit {gaps.topObj[1]} time{gaps.topObj[1] > 1 ? "s" : ""}. Practise the rebuttal until it's second nature.</p>
+                    <button onClick={() => onSetTab("objections")} style={{
+                      background: "#713f12", border: "none", borderRadius: 8, padding: "6px 14px", color: "#fbbf24", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    }}>Review Rebuttal →</button>
+                  </div>
+                )}
+                {gaps.weakSkill && SKILL_DRILLS[gaps.weakSkill[0]] && (
+                  <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 12, padding: 14 }}>
+                    <p style={{ color: "#60a5fa", fontSize: 12, fontWeight: 700, marginBottom: 4 }}>📈 Lowest skill score: {SKILL_DRILLS[gaps.weakSkill[0]].label} (avg {gaps.avgScores[gaps.weakSkill[0]].toFixed(1)}/5)</p>
+                    <p style={{ color: "#93c5fd", fontSize: 13, marginBottom: 10 }}>{SKILL_DRILLS[gaps.weakSkill[0]].drill}</p>
+                    <button onClick={() => onSetTab(SKILL_DRILLS[gaps.weakSkill[0]].tab)} style={{
+                      background: "#1e3a5f", border: "none", borderRadius: 8, padding: "6px 14px", color: "#60a5fa", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    }}>Go there →</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Weekly bar chart */}
+          <div style={{ marginBottom: 20 }}>
+            <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 12 }}>7-Day Momentum</p>
+            <div style={{ display: "flex", gap: 6, alignItems: "flex-end", height: 80 }}>
+              {week.map((d, i) => {
+                const pct = d.score !== null ? (d.score / 10) * 100 : 0;
+                const col = d.score >= 7 ? "#4ade80" : d.score >= 4 ? "#fbbf24" : d.score !== null ? "#f87171" : "#2d3748";
+                return (
+                  <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: "100%", background: "#1a1d27", borderRadius: 4, height: 64, display: "flex", alignItems: "flex-end", overflow: "hidden" }}>
+                      <div style={{ width: "100%", height: `${pct}%`, background: col, borderRadius: "4px 4px 0 0", transition: "height .4s", opacity: d.label === "Today" ? 1 : 0.6 }} />
+                    </div>
+                    <span style={{ color: d.label === "Today" ? "#f1f5f9" : "#64748b", fontSize: 10, fontWeight: d.label === "Today" ? 700 : 400 }}>{d.label}</span>
+                    {d.score !== null && <span style={{ color: col, fontSize: 10 }}>{d.score}</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Call log */}
+          <div style={{ marginBottom: 20 }}>
+            <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 12 }}>Today's Calls ({today.length})</p>
+            {[...today].reverse().map((c, i) => {
+              const t = new Date(c.time);
+              const timeStr = t.toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit" });
+              const obj = OBJECTIONS.find(o => o.id === c.objectionId);
+              const ind = INDUSTRIES.find(x => x.id === c.industryId);
+              return (
+                <div key={i} style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px 14px", background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 10, marginBottom: 6 }}>
+                  <div style={{ width: 10, height: 10, borderRadius: "50%", background: OUTCOME_COLOURS[c.outcome], flexShrink: 0 }} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <span style={{ color: OUTCOME_COLOURS[c.outcome], fontSize: 13, fontWeight: 700 }}>{OUTCOME_LABELS[c.outcome]}</span>
+                      <span style={{ color: "#64748b", fontSize: 12 }}>at {timeStr}</span>
+                      {c.isFirstCall && <span style={{ background: "#052e16", color: "#4ade80", fontSize: 10, fontWeight: 700, borderRadius: 99, padding: "1px 7px" }}>1st call</span>}
+                      {c.callType === "inbound" && <span style={{ background: "#150d2e", color: "#c084fc", fontSize: 10, fontWeight: 700, borderRadius: 99, padding: "1px 7px" }}>inbound</span>}
+                      {ind && <span style={{ color: "#64748b", fontSize: 11 }}>{ind.icon}</span>}
+                      {obj && <span style={{ color: "#fbbf24", fontSize: 11 }}>objection: {obj.objection.substring(0, 30)}…</span>}
+                    </div>
+                    {c.notes && <p style={{ color: "#64748b", fontSize: 12, marginTop: 2 }}>{c.notes}</p>}
+                  </div>
+                  <span style={{ color: "#94a3b8", fontSize: 13, fontWeight: 600, flexShrink: 0 }}>{c.weight}/10</span>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Industry breakdown */}
+          {industryBreakdown.length > 0 && (
+            <div>
+              <p style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 12 }}>Industry Performance Today</p>
+              {industryBreakdown.map((ind, i) => (
+                <div key={i} style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px 14px", background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 10, marginBottom: 6 }}>
+                  <span style={{ fontSize: 20, flexShrink: 0 }}>{ind.icon}</span>
+                  <div style={{ flex: 1 }}>
+                    <p style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 600 }}>{ind.name}</p>
+                    <p style={{ color: "#64748b", fontSize: 11 }}>{ind.calls} call{ind.calls > 1 ? "s" : ""} · {ind.wins} won · avg score {ind.avgWeight}</p>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <p style={{ color: ind.winRate >= 60 ? "#4ade80" : ind.winRate >= 30 ? "#fbbf24" : "#f87171", fontSize: 18, fontWeight: 800 }}>{ind.winRate}%</p>
+                    <p style={{ color: "#64748b", fontSize: 10 }}>win rate</p>
+                  </div>
+                </div>
+              ))}
+              <button onClick={() => onSetTab("industries")} style={{
+                marginTop: 8, background: "none", border: "1px solid #2d3748", borderRadius: 8, padding: "6px 14px",
+                color: "#64748b", fontSize: 12, cursor: "pointer",
+              }}>View all Industry Cards →</button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function FloatingLogButton({ onClick }) {
+      return (
+        <button onClick={onClick} style={{
+          position: "fixed", bottom: 24, right: 24, zIndex: 900,
+          background: "#2563eb", color: "#fff", border: "none", borderRadius: 99,
+          padding: "12px 20px", fontSize: 14, fontWeight: 700, cursor: "pointer",
+          boxShadow: "0 4px 20px rgba(37,99,235,.5)", display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <span style={{ fontSize: 18 }}>📞</span> Log Call
+        </button>
+      );
+    }
+
+    /* ─────────────────────────── PRE-CALL PLANNER ─────────────────────────── */
+
+    const PRE_CALL_CHECKLIST = [
+      "Know the business name + decision-maker's name",
+      "Know their current payment provider (ask if you don't)",
+      "Clear close objective: first-call close OR book follow-up",
+      "Opener scripted and ready to go",
+      "Top 1–2 likely objections anticipated with rebuttals ready",
+    ];
+
+    function PreCallModal({ onStart, onClose }) {
+      const [industryId, setIndustryId]     = useState("");
+      const [callType,   setCallType]       = useState("outbound");
+      const [checklist,  setChecklist]      = useState(Array(PRE_CALL_CHECKLIST.length).fill(false));
+      const [opener,     setOpener]         = useState("");
+
+      const selectedIndustry = INDUSTRIES.find(i => i.id === industryId);
+      const allChecked = checklist.every(Boolean);
+
+      function toggleCheck(i) {
+        setChecklist(prev => prev.map((v, idx) => idx === i ? !v : v));
+      }
+
+      return (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.8)", zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+          <div style={{ background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 18, padding: 24, width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <h2 style={{ color: "#f1f5f9", fontSize: 18, fontWeight: 800 }}>🎯 Pre-Call Setup</h2>
+              <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+
+            {/* Call type */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>Call type</p>
+            <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+              {["inbound", "outbound"].map(t => (
+                <button key={t} onClick={() => setCallType(t)} style={{
+                  flex: 1, padding: "10px", borderRadius: 10, cursor: "pointer", fontSize: 13, fontWeight: 700,
+                  border: `1px solid ${callType === t ? (t === "inbound" ? "#4ade80" : "#60a5fa") : "#2d3748"}`,
+                  background: callType === t ? (t === "inbound" ? "#052e16" : "#0c1a2e") : "transparent",
+                  color: callType === t ? (t === "inbound" ? "#4ade80" : "#60a5fa") : "#64748b",
+                }}>
+                  {t === "inbound" ? "📥 Inbound" : "📤 Outbound"}
+                </button>
+              ))}
+            </div>
+
+            {/* Industry */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>Industry (optional)</p>
+            <select value={industryId} onChange={e => setIndustryId(e.target.value)} style={{
+              width: "100%", padding: "10px 12px", background: "#0f1117", border: "1px solid #2d3748",
+              borderRadius: 8, color: "#e2e8f0", fontSize: 13, marginBottom: 18, outline: "none",
+            }}>
+              <option value="">— Select industry —</option>
+              {INDUSTRIES.map(i => <option key={i.id} value={i.id}>{i.icon} {i.name.split("(")[0].trim()}</option>)}
+            </select>
+
+            {/* Industry tip */}
+            {selectedIndustry && (
+              <div style={{ background: "#0c1a2e", border: "1px solid #1e3a5f", borderRadius: 10, padding: 12, marginBottom: 18 }}>
+                <p style={{ color: "#60a5fa", fontSize: 12, fontWeight: 700, marginBottom: 4 }}>💡 Opening hook for {selectedIndustry.name.split("(")[0].trim()}</p>
+                <p style={{ color: "#93c5fd", fontSize: 12, fontStyle: "italic" }}>{selectedIndustry.hook}</p>
+                <p style={{ color: "#64748b", fontSize: 11, marginTop: 6 }}>Common rejection: {selectedIndustry.rejection[0]}</p>
+              </div>
+            )}
+
+            {/* Checklist */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 10 }}>Pre-call checklist</p>
+            <div style={{ marginBottom: 18 }}>
+              {PRE_CALL_CHECKLIST.map((item, i) => (
+                <div key={i} onClick={() => toggleCheck(i)} style={{
+                  display: "flex", gap: 10, alignItems: "center", padding: "9px 12px",
+                  background: checklist[i] ? "#052e16" : "#0f1117", borderRadius: 8, marginBottom: 6,
+                  border: `1px solid ${checklist[i] ? "#14532d" : "#2d3748"}`, cursor: "pointer",
+                }}>
+                  <span style={{ fontSize: 16, flexShrink: 0 }}>{checklist[i] ? "✅" : "⬜"}</span>
+                  <span style={{ color: checklist[i] ? "#4ade80" : "#94a3b8", fontSize: 13 }}>{item}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Opener */}
+            <p style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>Your planned opener (optional)</p>
+            <textarea value={opener} onChange={e => setOpener(e.target.value)}
+              placeholder="Write your first 2 sentences before you dial..."
+              style={{ width: "100%", padding: "10px 12px", background: "#0f1117", border: "1px solid #2d3748", borderRadius: 8, color: "#e2e8f0", fontSize: 13, resize: "vertical", minHeight: 72, outline: "none", marginBottom: 20 }}
+            />
+
+            {!allChecked && (
+              <p style={{ color: "#fbbf24", fontSize: 12, marginBottom: 12, fontWeight: 600 }}>⚠️ {checklist.filter(Boolean).length}/{PRE_CALL_CHECKLIST.length} items checked — tick all 5 for a first-call close edge</p>
+            )}
+
+            <p style={{ color: "#64748b", fontSize: 11, marginBottom: 10, textAlign: "center" }}>
+              After the call ends, tap <strong style={{ color: "#94a3b8" }}>📞 Log Call</strong> — your industry + call type will be pre-filled.
+            </p>
+            <button onClick={() => onStart({ industryId: industryId || null, callType, checklist, opener })} style={{
+              width: "100%", padding: "14px", background: allChecked ? "#16a34a" : "#2563eb", border: "none", borderRadius: 10,
+              color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer",
+            }}>
+              {allChecked ? "✅ Prep Done — Dial Now" : "Skip to Dialling →"}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    /* ─────────────────────────── LIVE LISTEN ─────────────────────────── */
+
+    const DANGER_KEYWORDS = [
+      { phrases: ["surcharge", "surcharging", "rba", "zero cost", "zero fee", "no fee"], objectionId: "surcharge-ban" },
+      { phrases: ["contract", "locked in", "lock in", "exit fee", "12 month", "24 month"], objectionId: "locked-in" },
+      { phrases: ["with my bank", "our bank", "commonwealth", "nab", "anz", "westpac", "use the bank"], objectionId: "happy-with-bank" },
+      { phrases: ["too expensive", "cost too much", "too much", "cheaper option", "other quote", "better rate"], objectionId: "costs-too-much" },
+      { phrases: ["think about it", "need to think", "let me think", "call you back", "get back to you"], objectionId: "need-to-think" },
+      { phrases: ["partner", "spouse", "husband", "wife", "other director", "run it by"], objectionId: "speak-to-partner" },
+      { phrases: ["call you back", "busy right now", "not now", "bad time", "call me later"], objectionId: "will-call-back" },
+      { phrases: ["complicated", "too hard", "difficult to switch", "not sure how", "too much hassle"], objectionId: "too-complicated" },
+      { phrases: ["not ready", "not the right time", "bad timing", "slow period", "just expanded"], objectionId: "bad-timing" },
+    ];
+
+    const BUYING_SIGNALS = [
+      "how much", "what's the cost", "what does it cost", "what do you charge",
+      "how long does it take", "how quickly", "when can you", "sounds good",
+      "that's interesting", "tell me more", "how does that work", "what's included",
+      "can you send", "send me", "do you do", "is that available",
+      "yes", "sure", "happy to", "let's do it", "let's go ahead",
+    ];
+
+    function LiveListenPanel({ onGradeCall, onClose }) {
+      const streamRef      = useRef(null);
+      const recognitionRef = useRef(null);
+      const audioCtxRef    = useRef(null);
+      const analyserRef    = useRef(null);
+      const animFrameRef   = useRef(null);
+      const timerRef       = useRef(null);
+      const startTimeRef   = useRef(null);
+
+      const [isListening, setIsListening] = useState(false);
+      const [transcript,  setTranscript]  = useState("");
+      const [alerts,      setAlerts]      = useState([]);
+      const [signals,     setSignals]     = useState([]);
+      const [callTimer,   setCallTimer]   = useState(0);
+      const [audioLevel,  setAudioLevel]  = useState(0);
+      const [permError,     setPermError]     = useState(null);
+      const [showPingPong,  setShowPingPong]  = useState(false);
+      const [pingPongIdx,   setPingPongIdx]   = useState(0);
+
+      useEffect(() => { return () => stopAll(); }, []);
+
+      // Auto-jump ping-pong when a new objection is detected
+      useEffect(() => {
+        if (!alerts.length || !showPingPong) return;
+        const lastId = alerts[alerts.length - 1].objectionId;
+        const idx = OBJECTIONS.findIndex(o => o.id === lastId);
+        if (idx >= 0) setPingPongIdx(idx);
+      }, [alerts]);
+
+      function stopAll() {
+        if (recognitionRef.current) { try { recognitionRef.current.stop(); } catch {} recognitionRef.current = null; }
+        if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+        if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch {} audioCtxRef.current = null; }
+        if (animFrameRef.current) { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = null; }
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      }
+
+      function analyzeText(text) {
+        const lower = text.toLowerCase();
+        for (const { phrases, objectionId } of DANGER_KEYWORDS) {
+          for (const phrase of phrases) {
+            if (lower.includes(phrase)) {
+              setAlerts(prev => {
+                const recent = prev.find(a => a.objectionId === objectionId && (Date.now() - a.ts < 30000));
+                if (recent) return prev;
+                return [...prev.slice(-9), { objectionId, phrase, ts: Date.now() }];
+              });
+            }
+          }
+        }
+        for (const phrase of BUYING_SIGNALS) {
+          if (lower.includes(phrase)) {
+            setSignals(prev => prev.includes(phrase) ? prev : [...prev.slice(-9), phrase]);
+          }
+        }
+      }
+
+      async function startListening() {
+        stopAll(); // clean up any previous session first
+        setPermError(null);
+        setIsListening(false);
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true });
+          streamRef.current = stream;
+
+          const ctx      = new AudioContext();
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          const src = ctx.createMediaStreamSource(stream);
+          src.connect(analyser); // silent — NOT connected to ctx.destination
+          audioCtxRef.current  = ctx;
+          analyserRef.current  = analyser;
+
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          function tick() {
+            analyser.getByteTimeDomainData(data);
+            let sum = 0;
+            for (const v of data) sum += Math.abs(v - 128);
+            setAudioLevel(Math.min(100, Math.round((sum / data.length) * 5)));
+            animFrameRef.current = requestAnimationFrame(tick);
+          }
+          tick();
+
+          if ("webkitSpeechRecognition" in window) {
+            const recog = new webkitSpeechRecognition();
+            recog.continuous     = true;
+            recog.interimResults = true;
+            recog.lang           = "en-AU";
+            recog.onresult = (e) => {
+              let final_ = "";
+              for (let i = e.resultIndex; i < e.results.length; i++) {
+                if (e.results[i].isFinal) final_ += e.results[i][0].transcript + " ";
+              }
+              if (final_) {
+                setTranscript(prev => prev + final_);
+                analyzeText(final_);
+              }
+            };
+            recog.onend = () => { if (streamRef.current) { try { recog.start(); } catch {} } };
+            recog.onerror = (e) => { if (e.error !== "no-speech") console.warn("Recog:", e.error); };
+            recog.start();
+            recognitionRef.current = recog;
+          }
+
+          startTimeRef.current = Date.now();
+          timerRef.current = setInterval(() => {
+            setCallTimer(Math.floor((Date.now() - startTimeRef.current) / 1000));
+          }, 1000);
+
+          setIsListening(true);
+        } catch (err) {
+          if (err.name === "NotAllowedError" || err.name === "AbortError") {
+            setPermError("Share was cancelled. Click Start and choose the tab with your softphone.");
+          } else {
+            setPermError("Could not capture: " + err.message);
+          }
+        }
+      }
+
+      function stopListening() { stopAll(); setIsListening(false); }
+
+      function handleGradeCall() {
+        const lastAlert = alerts[alerts.length - 1];
+        stopListening();
+        onGradeCall({
+          notes: transcript.slice(-400) || "",
+          objectionId: lastAlert?.objectionId || "",
+          stageReached: lastAlert ? "objection" : null,
+        });
+      }
+
+      function fmt(sec) {
+        return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+      }
+
+      const latestAlerts = alerts.slice(-3).reverse();
+
+      return (
+        <div style={{
+          position: "fixed", bottom: 24, left: 24, zIndex: 950,
+          width: "min(340px, calc(100vw - 48px))",
+          background: "#1a1d27", border: "1px solid #2d3748", borderRadius: 16,
+          boxShadow: "0 8px 40px rgba(0,0,0,.7)", padding: 20,
+        }}>
+          {/* Header */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span style={{ fontSize: 18 }}>🎤</span>
+              <span style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 15 }}>Live Listen</span>
+              {isListening && (
+                <span style={{
+                  background: "#dc2626", color: "#fff", fontSize: 10, fontWeight: 700,
+                  borderRadius: 99, padding: "2px 8px",
+                }}>LIVE</span>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              {isListening && (
+                <span style={{ color: "#60a5fa", fontSize: 13, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                  {fmt(callTimer)}
+                </span>
+              )}
+              <button onClick={() => setShowPingPong(p => !p)} title="Ping-Pong mode" style={{ background: showPingPong ? "#1e40af" : "none", border: `1px solid ${showPingPong ? "#3b82f6" : "transparent"}`, color: showPingPong ? "#60a5fa" : "#64748b", cursor: "pointer", borderRadius: 6, padding: "2px 8px", fontSize: 13, fontWeight: 700, lineHeight: 1.4 }}>🏓</button>
+              <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 20, lineHeight: 1 }}>×</button>
+            </div>
+          </div>
+
+          {/* Audio level bar */}
+          {isListening && (
+            <div style={{ height: 6, background: "#0f1117", borderRadius: 99, marginBottom: 14, overflow: "hidden" }}>
+              <div style={{
+                height: "100%", width: `${audioLevel}%`, borderRadius: 99,
+                background: audioLevel > 60 ? "#4ade80" : audioLevel > 20 ? "#fbbf24" : "#2563eb",
+                transition: "width .08s",
+              }} />
+            </div>
+          )}
+
+          {/* Detected objections */}
+          {latestAlerts.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <p style={{ color: "#f87171", fontSize: 11, fontWeight: 700, marginBottom: 6, textTransform: "uppercase" }}>⚠️ Objection Detected</p>
+              {latestAlerts.map((a, i) => {
+                const obj = OBJECTIONS.find(o => o.id === a.objectionId);
+                return (
+                  <div key={i} style={{
+                    background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 8, padding: "8px 12px", marginBottom: 6,
+                  }}>
+                    <p style={{ color: "#f87171", fontWeight: 700, fontSize: 12, marginBottom: 3 }}>{obj?.objection || a.objectionId}</p>
+                    <p style={{ color: "#94a3b8", fontSize: 11 }}>{obj?.rebuttal?.substring(0, 100)}…</p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Buying signals */}
+          {signals.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <p style={{ color: "#4ade80", fontSize: 11, fontWeight: 700, marginBottom: 6, textTransform: "uppercase" }}>🟢 Buying Signals</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {signals.slice(-6).map((s, i) => (
+                  <span key={i} style={{
+                    background: "#052e16", border: "1px solid #14532d", color: "#4ade80",
+                    fontSize: 11, fontWeight: 600, borderRadius: 99, padding: "2px 8px",
+                  }}>"{s}"</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Ping-Pong */}
+          {showPingPong && (() => {
+            const obj = OBJECTIONS[pingPongIdx];
+            const tech = TECHNIQUE_MAP[obj.id] || { technique: "Consult", color: "#94a3b8", tone: "Calm and curious." };
+            return (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: "10px 10px 0 0", padding: 10 }}>
+                  <div style={{ color: "#f87171", fontSize: 10, fontWeight: 800, marginBottom: 4 }}>🙋 CUSTOMER SAYS</div>
+                  <p style={{ color: "#fca5a5", fontSize: 13, fontStyle: "italic", lineHeight: 1.5 }}>"{obj.objection}"</p>
+                </div>
+                <div style={{ background: "#0f1d3d", border: "1px solid #1e3a5f", borderTop: "none", borderRadius: "0 0 10px 10px", padding: 10 }}>
+                  <div style={{ color: "#60a5fa", fontSize: 10, fontWeight: 800, marginBottom: 4 }}>🎯 YOU SAY</div>
+                  <p style={{ color: "#dbeafe", fontSize: 12, fontStyle: "italic", lineHeight: 1.5 }}>"{obj.rebuttal.substring(0, 150)}{obj.rebuttal.length > 150 ? "…" : ""}"</p>
+                  <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                    <span style={{ color: tech.color, fontSize: 10, fontWeight: 700, background: tech.color + "18", borderRadius: 4, padding: "2px 6px" }}>{tech.technique}</span>
+                    <span style={{ color: "#64748b", fontSize: 10 }}>🎙️ {tech.tone.split(".")[0]}</span>
+                  </div>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                  <button onClick={() => setPingPongIdx((pingPongIdx - 1 + OBJECTIONS.length) % OBJECTIONS.length)} style={{ background: "#1a1d27", border: "1px solid #2d3748", color: "#94a3b8", borderRadius: 6, padding: "4px 14px", fontSize: 14, cursor: "pointer" }}>◀</button>
+                  <span style={{ color: "#475569", fontSize: 11 }}>{obj.icon} {pingPongIdx + 1} / {OBJECTIONS.length}</span>
+                  <button onClick={() => setPingPongIdx((pingPongIdx + 1) % OBJECTIONS.length)} style={{ background: "#1a1d27", border: "1px solid #2d3748", color: "#94a3b8", borderRadius: 6, padding: "4px 14px", fontSize: 14, cursor: "pointer" }}>▶</button>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Transcript */}
+          {transcript && (
+            <div style={{ marginBottom: 12 }}>
+              <p style={{ color: "#64748b", fontSize: 11, fontWeight: 700, marginBottom: 4, textTransform: "uppercase" }}>Transcript (mic)</p>
+              <div style={{ maxHeight: 70, overflowY: "auto", background: "#0f1117", borderRadius: 8, padding: "6px 10px" }}>
+                <p style={{ color: "#94a3b8", fontSize: 11, lineHeight: 1.5 }}>{transcript.slice(-300)}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Permission error */}
+          {permError && (
+            <div style={{ background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 8, padding: "8px 12px", marginBottom: 12 }}>
+              <p style={{ color: "#f87171", fontSize: 12 }}>{permError}</p>
+            </div>
+          )}
+
+          {/* Controls */}
+          <div style={{ display: "flex", gap: 8 }}>
+            {!isListening ? (
+              <button onClick={startListening} style={{
+                flex: 1, background: "#dc2626", color: "#fff", border: "none",
+                borderRadius: 8, padding: "10px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer",
+              }}>▶ Start Listening</button>
+            ) : (
+              <>
+                <button onClick={stopListening} style={{
+                  flex: 1, background: "#475569", color: "#fff", border: "none",
+                  borderRadius: 8, padding: "10px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer",
+                }}>■ Stop</button>
+                <button onClick={handleGradeCall} style={{
+                  flex: 1, background: "#2563eb", color: "#fff", border: "none",
+                  borderRadius: 8, padding: "10px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer",
+                }}>Grade Call →</button>
+              </>
+            )}
+          </div>
+
+          <p style={{ color: "#475569", fontSize: 10, marginTop: 10, lineHeight: 1.5 }}>
+            Chrome will ask you to share a tab. Choose the tab with your softphone. Audio is analysed only — never recorded or sent anywhere.
+          </p>
+        </div>
+      );
+    }
+
+    /* ─────────────────────────── EXPORT ─────────────────────────── */
+
+    function exportCSV() {
+      const rows = [
+        ["Category", "Industry", "Target_Customer", "Annual_Revenue", "Expected_Call_Time", "Call_Type", "Use_Case", "Opening_Hook", "Reconciliation_Watchout", "Why_They_Reject", "Pivot_Suggestion", "Walk_Away_When", "Buyer_Signals"],
+        ...INDUSTRIES.map(i => [
+          "Industry",
+          i.name,
+          i.target,
+          i.annualRevenue,
+          i.callTime,
+          i.callType,
+          i.useCase,
+          i.hook,
+          i.reconciliation,
+          i.rejection.join(" | "),
+          i.pivot,
+          i.altTarget,
+          i.buyerSignals.join(" | "),
+        ]),
+        ["Category", "Competitor", "Summary", "Their_Strengths", "Their_Weaknesses", "Counter_Script", "Win_When", "Lose_When"],
+        ...BATTLE_CARDS.map(b => [
+          "BattleCard",
+          b.competitor,
+          b.summary,
+          b.strengths.join(" | "),
+          b.weaknesses.join(" | "),
+          b.counterScript,
+          b.winWhen,
+          b.loseTo,
+        ]),
+      ];
+
+      const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "shift4-sales-engine.csv"; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    /* ─────────────────────────── APP ─────────────────────────── */
+
+    const OUTCOME_LABELS = { won: "Won", progressing: "Progressed", lost: "Lost", noanswer: "No Answer", voicemail: "Voicemail", wrongnumber: "Wrong #" };
+    const OUTCOME_COLOURS = { won: "#4ade80", progressing: "#60a5fa", lost: "#f87171", noanswer: "#64748b", voicemail: "#c084fc", wrongnumber: "#475569" };
+
+    const CALL_STATES = [
+      { id: "open",       label: "Call Open",      icon: "🟢", color: "#16a34a", bg: "#052e16", border: "#14532d" },
+      { id: "losing",     label: "Losing Call",    icon: "🔴", color: "#dc2626", bg: "#1f0a0a", border: "#7f1d1d" },
+      { id: "objecting",  label: "Objecting",      icon: "🟡", color: "#ca8a04", bg: "#1c1400", border: "#713f12" },
+      { id: "closed",     label: "Closed / Won",   icon: "🏆", color: "#7c3aed", bg: "#150d2e", border: "#4c1d95" },
+      { id: "dead",       label: "Dead Lead",      icon: "💀", color: "#475569", bg: "#0f1117", border: "#334155" },
+    ];
+
+    function CallStateToggle({ callState, setCallState }) {
+      return (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ color: "#64748b", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px", marginRight: 4 }}>Call Status:</span>
+          {CALL_STATES.map(s => (
+            <button
+              key={s.id}
+              onClick={() => setCallState(s.id)}
+              style={{
+                padding: "4px 12px", border: `1px solid ${callState === s.id ? s.color : "#334155"}`,
+                borderRadius: 99, cursor: "pointer", fontSize: 12, fontWeight: 600,
+                background: callState === s.id ? s.bg : "transparent",
+                color: callState === s.id ? s.color : "#64748b",
+                transition: "all .15s",
+              }}
+            >
+              {s.icon} {s.label}
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    function App() {
+      const [activeTab, setActiveTab]       = useState("industries");
+      const [callState, setCallState]       = useState("open");
+      const [callLog, setCallLog]           = useState([]);
+      const [showFeedback, setShowFeedback]   = useState(false);
+      const [showIntervention, setShowIntervention] = useState(false);
+      const [interventionStreak, setInterventionStreak] = useState(0);
+      const [dismissedAt, setDismissedAt]     = useState(null);
+      const [showLiveListen, setShowLiveListen] = useState(false);
+      const [liveGradeInit, setLiveGradeInit]   = useState({});
+      const [showPreCall, setShowPreCall]         = useState(false);
+      const [preCallContext, setPreCallContext]   = useState({});
+      const [isLoading, setIsLoading]             = useState(true);
+
+      // Load call log from Supabase (or localStorage fallback) on mount
+      useEffect(() => {
+        fetchCallLog().then(calls => { setCallLog(calls); setIsLoading(false); });
+      }, []);
+
+      const currentState = CALL_STATES.find(s => s.id === callState);
+      const todayStreak  = getBadStreak(callLog);
+
+      // Soft warning: 2 bad in a row (not yet a hard stop)
+      const softWarn = todayStreak === 2;
+
+      async function handleSaveCall(call) {
+        await persistCall(call);
+        const newLog = [...callLog, call];
+        setCallLog(newLog);
+        setShowFeedback(false);
+        setPreCallContext({});
+
+        const streak = getBadStreak(newLog);
+        const hourTrigger = checkHourTrigger(newLog);
+
+        // Hard stop: 3+ bad in a row OR bad hour block
+        // Only fire if we haven't dismissed in the last 10 minutes
+        const now = Date.now();
+        const cooldown = dismissedAt && (now - dismissedAt) < 600000;
+        if (!cooldown && (streak >= 3 || hourTrigger)) {
+          setInterventionStreak(streak);
+          setShowIntervention(true);
+        }
+      }
+
+      function handleDismissIntervention() {
+        setShowIntervention(false);
+        setDismissedAt(Date.now());
+      }
+
+      function handleGradeCall(init) {
+        setShowLiveListen(false);
+        setLiveGradeInit(init || {});
+        setShowFeedback(true);
+      }
+
+      function handlePreCallStart(ctx) {
+        setPreCallContext(ctx || {});
+        setShowPreCall(false);
+      }
+
+      const views = {
+        industries:  <IndustryView />,
+        battlecards: <BattleCardsView />,
+        bna:         <BNAView />,
+        objections:  <ObjectionsView callState={callState} />,
+        lostleads:   <LostLeadsView />,
+        surcharge:   <SurchargeIntelView />,
+        incentives:  <IncentivesView />,
+        social:      <SocialProofView />,
+        facts:       <QuickFactsView />,
+        coaching:    <CoachingView log={callLog} onSetTab={setActiveTab} isLoading={isLoading} />,
+      };
+
+      return (
+        <div style={{ minHeight: "100vh" }}>
+          {/* Header */}
+          <div style={{
+            background: "linear-gradient(135deg, #1e3a5f 0%, #0f1117 60%)",
+            borderBottom: "1px solid #2d3748", padding: "20px 24px 0",
+          }}>
+            <div style={{ maxWidth: 960, margin: "0 auto" }}>
+              {/* Top row */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <div style={{
+                    width: 40, height: 40, background: "#2563eb", borderRadius: 10,
+                    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20,
+                  }}>💳</div>
+                  <div>
+                    <h1 style={{ fontSize: 20, fontWeight: 800, color: "#f1f5f9" }}>Shift4 Sales Engine</h1>
+                    <p style={{ color: "#64748b", fontSize: 12 }}>Australian Market · Live call reference</p>
+                  </div>
+                </div>
+                {/* Right-side controls */}
+                <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => setShowLiveListen(v => !v)}
+                    style={{
+                      background: showLiveListen ? "#dc2626" : "#1a1d27",
+                      border: `1px solid ${showLiveListen ? "#dc2626" : "#2d3748"}`,
+                      borderRadius: 99, padding: "6px 14px", fontSize: 12, fontWeight: 700,
+                      cursor: "pointer", color: showLiveListen ? "#fff" : "#94a3b8",
+                      display: "flex", alignItems: "center", gap: 6,
+                    }}
+                  >
+                    🎤 {showLiveListen ? "Listening…" : "Live Listen"}
+                  </button>
+                  <div style={{
+                    background: currentState.bg, border: `1px solid ${currentState.border}`,
+                    borderRadius: 10, padding: "6px 14px", fontSize: 14, fontWeight: 700, color: currentState.color,
+                  }}>
+                    {currentState.icon} {currentState.label}
+                  </div>
+                </div>
+              </div>
+
+              {/* Call State Toggle */}
+              <div style={{ marginBottom: 12 }}>
+                <CallStateToggle callState={callState} setCallState={setCallState} />
+              </div>
+
+              {/* Tabs */}
+              <div style={{ display: "flex", gap: 2, overflowX: "auto", paddingBottom: 0 }}>
+                {TABS.map(tab => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    style={{
+                      padding: "9px 14px", border: "none", cursor: "pointer",
+                      fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
+                      borderRadius: "8px 8px 0 0",
+                      background: activeTab === tab.id ? "#1a1d27" : "transparent",
+                      color: activeTab === tab.id ? "#60a5fa" : "#64748b",
+                      borderBottom: activeTab === tab.id ? "2px solid #2563eb" : "2px solid transparent",
+                      transition: "all .15s",
+                    }}
+                  >
+                    {tab.icon} {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Surcharge deadline notice */}
+          {callState === "open" && !softWarn && (
+            <div style={{ background: "#1f0a0a", borderBottom: "1px solid #7f1d1d", padding: "8px 24px" }}>
+              <div style={{ maxWidth: 960, margin: "0 auto" }}>
+                <p style={{ color: "#f87171", fontSize: 12, fontWeight: 600 }}>⚠️ SURCHARGE BAN — 1 Oct 2026. Use deadline as urgency on every call. See Surcharge Intel tab for full script.</p>
+              </div>
+            </div>
+          )}
+
+          {/* Soft warning — 2 bad calls in a row */}
+          {softWarn && (
+            <div style={{ background: "#1c1400", borderBottom: "1px solid #713f12", padding: "10px 24px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ maxWidth: 960, margin: "0 auto", width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                <p style={{ color: "#fbbf24", fontSize: 13, fontWeight: 600 }}>
+                  🟡 Two tough calls in a row — you're doing fine. Check the Objections tab before the next one and make sure your opener is landing.
+                </p>
+                <button onClick={() => setActiveTab("objections")} style={{
+                  background: "#713f12", border: "none", borderRadius: 8, padding: "6px 14px",
+                  color: "#fbbf24", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+                }}>Objections →</button>
+              </div>
+            </div>
+          )}
+
+          {/* Content */}
+          <div style={{ maxWidth: 960, margin: "0 auto", padding: "24px 24px 100px" }}>
+            {views[activeTab]}
+          </div>
+
+          {/* Floating buttons */}
+          <button onClick={() => setShowPreCall(true)} style={{
+            position: "fixed", bottom: 80, right: 24, zIndex: 900,
+            background: preCallContext.callType ? "#16a34a" : "#1a1d27",
+            border: `1px solid ${preCallContext.callType ? "#14532d" : "#2d3748"}`,
+            color: preCallContext.callType ? "#4ade80" : "#94a3b8",
+            borderRadius: 99, padding: "10px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer",
+            boxShadow: "0 4px 16px rgba(0,0,0,.4)", display: "flex", alignItems: "center", gap: 8,
+          }}>
+            🎯 {preCallContext.callType ? "Pre-call done ✓" : "Pre-Call"}
+          </button>
+          <FloatingLogButton onClick={() => setShowFeedback(true)} />
+
+          {/* Pre-call planner modal */}
+          {showPreCall && (
+            <PreCallModal
+              onStart={handlePreCallStart}
+              onClose={() => setShowPreCall(false)}
+            />
+          )}
+
+          {/* Live Listen panel */}
+          {showLiveListen && (
+            <LiveListenPanel
+              onGradeCall={handleGradeCall}
+              onClose={() => setShowLiveListen(false)}
+            />
+          )}
+
+          {/* Post-call feedback modal */}
+          {showFeedback && (
+            <FeedbackModal
+              onSave={handleSaveCall}
+              onClose={() => { setShowFeedback(false); setLiveGradeInit({}); setPreCallContext({}); }}
+              initialValues={{ ...preCallContext, ...liveGradeInit }}
+            />
+          )}
+
+          {/* Hard stop intervention modal */}
+          {showIntervention && (
+            <InterventionModal
+              streak={interventionStreak}
+              log={callLog}
+              onDismiss={handleDismissIntervention}
+              onSetTab={(tab) => { setActiveTab(tab); handleDismissIntervention(); }}
+            />
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
